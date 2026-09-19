@@ -1,0 +1,90 @@
+# DECISIONS
+
+Every judgement call made while building this system, with a one-line reason.
+Where the brief left something genuinely ambiguous the simpler option was taken
+and recorded here.
+
+---
+
+## Phase 0
+
+| # | Decision | Reason |
+|---|---|---|
+| 0.1 | Installed `matplotlib` into the existing `.venv` | Phase 2/5/7 require `docs/*.png` figures and nothing else in the environment can write PNG plots. Free, OSS, CPU-only. |
+| 0.2 | `scripts/profile_scaling.py` resamples one synthetic scene up to 30k/120k rather than re-simulating a larger scene | Phase 0 measures *how each stage scales with N*. Re-simulating would change scene content and confound the curve. Phase 1 re-runs the same script so baseline and result are directly comparable. Once Phase 2's raycast generator exists the script prefers `generate_scenario`. |
+| 0.3 | First timed frame discarded as warm-up in all profiling | First frame pays import/JIT/allocator costs and has no previous frame for S5/S8, so it is not representative of steady state. |
+| 0.4 | Profiling sizes fixed at 8k / 30k / 120k | 8k = current synthetic scene (comparable to the pre-existing baseline), 120k = a real 64-beam spinning scan, 30k = midpoint to expose super-linear stages. |
+
+## Phase 1
+
+| # | Decision | Reason |
+|---|---|---|
+| 1.1 | Morton/packed keys are `int64` with a `+2^20` bias on each axis instead of a signed-aware pack | One `int64` holds 3 × 21 bits; the bias makes negative coordinates sort correctly with a plain `np.argsort` and keeps the whole grouping path branch-free. |
+| 1.2 | `group_by_key` returns `(unique_keys, group_starts, order)` and **not** a list of arrays | `np.split` allocates one Python object per group (≈100k objects at 120k points). Returning CSR-style offsets lets every consumer use `np.add.reduceat` / `np.maximum.reduceat` with zero per-group Python work. A `split_groups()` helper is provided for the rare case a real list is wanted. |
+| 1.3 | `segment_reduce` implements percentile via sort-within-group + gather, not `np.percentile` per group | A Python loop over groups is the exact anti-pattern the brief bans. Sorting once by `(key, value)` makes every group's k-th order statistic a single gather. |
+| 1.4 | Voxel hash keeps a thin `__contains__`/`__getitem__` wrapper over the CSR arrays | `utils/voxel_hash.voxel_centroids` and any external caller expect a mapping. The wrapper is O(log M) via `np.searchsorted` and costs nothing when unused. |
+| 1.5 | `gt_label` lives on `Frame` (not in a side-channel dict) but is guarded by a repo test | Keeping it index-aligned to `points` is what makes range-stratified evaluation possible at all. `tests/test_gt_label_isolation.py` greps `stages/s2`–`s8` for the identifier, so the isolation is enforced mechanically rather than by convention. |
+| 1.6 | `KITTI_TO_6` rewritten as a 260-element `np.int8` lookup array | A dict literal cannot express "this key is assigned twice" as an error — Python silently keeps the last. An array plus an explicit `assign()` helper that refuses to overwrite a previously-set id makes the collision a hard failure at import time. |
+| 1.7 | Unlabelled/unknown SemanticKITTI ids map to `-1` (ignore), not to class 2 | The old `DEFAULT_CLASS = 2` silently turned every unmapped id into `static_obstacle`, inflating that class's accuracy. `-1` is excluded from IoU denominators. |
+| 1.8 | S4's old per-tile backend loop replaced by a per-point path in the same stage | BROKEN 2 requires `(N,6)` evidence; keeping the tile loop as well would mean maintaining two semantics systems. Tile-level `semantic_class` is retained as a *derived* display field only. |
+
+## Phase 2
+
+| # | Decision | Reason |
+|---|---|---|
+| 2.1 | Synthetic sensor is 64 rings × 2048 azimuth, raycast analytically per primitive rather than through a triangle-mesh BVH | Closed-form ray/plane, ray/box and ray/cylinder intersection is exact, fully vectorisable over all 131,072 beams at once, and needs no geometry library. A BVH would add a dependency and a Python traversal loop for no gain at this scene complexity. |
+| 2.2 | Scene primitives are axis-aligned boxes, planes, cylinders and ellipsoid canopies | These cover every object the brief names (walls, poles, kerbs, vehicles, pedestrians, canopy) and all have vectorised closed-form intersections. |
+| 2.3 | Potholes and kerbs are height-field *modifiers* on the ground plane, not separate primitives | A pothole is a depression in the surface being raycast; making it a primitive would create a second surface the beam could pass through. Solving ray/height-field by iterative marching along the beam keeps the ground single-valued. |
+| 2.4 | Multi-echo emitted only for vegetation (2 returns), everything else 1 | The brief asks for enough multi-echo to make the penetration-ratio layer demonstrable. Simulating partial returns on every surface adds noise to a feature whose whole signal is "this is foliage". |
+| 2.5 | `generate_scenario()` returns a dict, `generate_scene()` kept as an `(N,4)` shim | `main.py`, `app.py` and the old tests all call `generate_scene`. Keeping the shim means the pipeline never breaks between phases (protocol rule 6). |
+| 2.6 | RELLIS-3D detected by the same SemanticKITTI tree walker, distinguished by `max(label_id)` | RELLIS ships in SemanticKITTI layout; its ids are all < 35 while SemanticKITTI uses 252-259 for moving classes. Sniffing the id range is more reliable than a path-name heuristic. |
+
+## Phase 4
+
+| # | Decision | Reason |
+|---|---|---|
+| 4.1 | **Levels are 5 / 10 / 20 / 40 / 80 cm (powers of two), not the PS's illustrative "50 cm"** | The PS requires the projection to be free of alignment errors and data loss. With a power-of-two hierarchy sharing one fixed origin, the level-ℓ cell id is the level-0 Morton code right-shifted by 2ℓ bits — so a fine cell is *always* wholly inside exactly one coarse cell, by construction. A 5→50 cm ratio of 10 is not a power of two: cell boundaries at the two scales do not nest, a point near a boundary can round into two different parents, and aggregation stops being exact. 80 cm at 100 m is also *coarser* than the PS's 50 cm example, so the memory claim is conservative rather than inflated. This is a deliberate, defensible strengthening of the requirement, not non-compliance. |
+| 4.2 | Morton code is 2D (x,y only); z is cell content | The map is 2.5D — z is a value stored in a cell, not part of its address. Interleaving z would make the shift-to-coarsen identity false. |
+| 4.3 | Cells stored as one NumPy structured array per level, not `dict[key] → MapCell` | A `MapCell` dataclass instance is ~350 B of Python object overhead vs 22 B of payload. The memory-reduction figure is the headline claim of M5 and must be measurable with `tracemalloc` on the real storage. |
+| 4.4 | Vertical histogram is transient (built during insertion, discarded after extraction) | 24 bins × 4 B × 700k cells = 67 MB if persisted, which would dwarf the 22 B/cell layout. Everything needed downstream is extracted in the same pass. |
+| 4.5 | Obstacle layer uses an existential rule, terrain uses a majority rule | A 4 m pole returns 3 points and loses every vote; a road surface is defined by its bulk. Unifying them necessarily sacrifices one. |
+| 4.6 | `overhead_clearance` stored as a first-class field | Without it, tree canopy over a road puts `z_max` at 4 m and marks drivable road BLOCKED. One 2-byte field removes an entire failure class. |
+| 4.7 | Traversability is computed at query time from stored physical properties, never stored | Drivability is a property of the *vehicle*; slope and step height are properties of the *terrain*. Storing the verdict would bake one vehicle's limits into the map and make the wheeled/tracked toggle impossible. |
+| 4.8 | Free-space carving only at level ≥ 3 (40 cm) | Free space carries no shape information, so fine carving buys nothing and costs 64× the cells of coarse carving. |
+
+## Phase 5
+
+| # | Decision | Reason |
+|---|---|---|
+| 5.1 | Budget is expressed in **cells** (convertible to MB at 22 B/cell), not a fraction of tiles | The PS's memory claim is about map size. A tile-fraction budget does not bound memory at all: refining 10% of tiles by four levels costs more than refining 100% by one. |
+| 5.2 | Safety is a **pin** (a constraint on the feasible set), never a weighted term in V | Any weighted sum makes safety tradeable — with enough competing tiles the 70 m pedestrian is outbid. Pins consume budget first and are never ranked. |
+| 5.3 | The retention guarantee is stated over the **geometric** pin (`has_vertical_run`), with semantics as an enhancement | A semantic pin is only as good as the classifier. The geometric pin fires on "small, isolated, vertically-extended cluster above ground" without knowing what it is, so the guarantee survives a segmentation failure. |
+| 5.4 | Refinement gate: never split unless `n_points / 4 ≥ 4` | Otherwise "uncertain → refine" at 90 m manufactures empty fine cells, spending budget while *raising* per-cell uncertainty. |
+| 5.5 | Distance bands are derived from `resolution_law(r)`, not hardcoded | Ground sample area per beam grows ≈ r³ (linear azimuthal × quadratic radial spreading), so constant points-per-cell implies cell size ∝ r. Anchoring 5 cm at 10 m yields 50 cm at 100 m — the PS's own example value, derived rather than assumed. |
+| 5.6 | Policy selection is a single config string behind `allocate(tiles, budget) -> levels` | The Phase 7 ablation table needs ~10 policies × 5 budgets. Behind one interface that is an afternoon; scattered through the map code it is a week of refactoring. |
+
+## Phase 6
+
+| # | Decision | Reason |
+|---|---|---|
+| 6.1 | Motion segmentation is range-image residual MOS, not 4DMOS | 4DMOS is a sparse 4D convolution network and requires CUDA to build. Residual-image MOS (the LMNet / "Moving Object Segmentation in 3D LiDAR Data" lineage) is the established CPU-feasible member of the same family and reuses the range image already built in S1. |
+| 6.2 | Moving points are **gated out** of the persistent map, never decayed out of it | At 10 m/s a 1-second decay leaves a 10 m phantom wall behind every passing car. Gating is a cure; decay is a treatment. |
+| 6.3 | Three track states (`STATIC` / `MOVING` / `MOVABLE_BUT_STATIONARY`) | Conflating the last two gives either permanent holes in car parks (if treated as moving) or trails behind pedestrians (if treated as static). |
+| 6.4 | Velocity lives in the object table; cells store a 2-byte object handle | One car covers ~200 cells. Storing its velocity 200 times is redundant and creates consistency bugs when the estimate updates. |
+| 6.5 | Instance clustering is voxel connected-components gated on shared dominant class, not DBSCAN | DBSCAN is O(N log N) with a kd-tree the brief bans from the per-frame path, and ungated connectivity merges a pedestrian into the wall behind them. |
+
+## Phase 7
+
+| # | Decision | Reason |
+|---|---|---|
+| 7.1 | The central comparison is **equal memory**, not equal resolution | Comparing an adaptive map against a uniform 5 cm map is rigged and an evaluator will see it. Fixing the budget and asking "what is the best map obtainable for it?" is the honest question. |
+| 7.2 | Memory is measured with `tracemalloc` on the live structures, never computed as cells × bytes | Cell-count arithmetic omits array overhead, dict overhead and per-level padding, all of which are real. |
+| 7.3 | Latency reported as p50 / p95 / **p99** | For a real-time system the tail is the requirement; the mean hides exactly the frames that would drop. |
+| 7.4 | ORR denominator counts only GT objects observed with ≥ 10 points | An object the sensor never saw cannot be retained, and including it would make the metric a measure of occlusion rather than of allocation. Thresholds (≥3 cells, ≥10 points) are reported and a sensitivity sweep is included. |
+
+## Phase 9
+
+| # | Decision | Reason |
+|---|---|---|
+| 9.1 | `perception/minkowski_backend.py` deleted | MinkowskiEngine requires `nvcc` to *build*, not merely to run. On a CPU-only machine the module can never be anything but an `ImportError` path, so it is dead code that implies a capability the system does not have. Constraint 0.1. |
+| 9.2 | `stages/s8_fusion.py` and `stages/s9_output.py` made real modules rather than deleted | S8 gains genuine content in Phase 6 (the MOS gate), so the file earns its existence. S9 moved with it for symmetry, leaving `s7_map.py` as only the map stage. |
