@@ -204,6 +204,7 @@ class Frame:
     ground_mask: Optional[np.ndarray] = None       # (N,) bool
     non_ground_mask: Optional[np.ndarray] = None   # (N,) bool
     ground_z: Optional[np.ndarray] = None          # (N,) float32 smooth ground height field
+    noise_mask: Optional[np.ndarray] = None        # (N,) bool  dust/rain returns
     tiles: Optional[List[Tile]] = None
     tile_of_point: Optional[np.ndarray] = None     # (N,) int32 index into tiles, -1 = outside
 

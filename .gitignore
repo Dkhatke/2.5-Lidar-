@@ -53,6 +53,7 @@ data/sequences/
 
 # ── Model checkpoints (large) ───────────────────────────────
 *.pt
+!adaptive_lidar/models/*.pt
 *.pth
 *.ckpt
 checkpoints/

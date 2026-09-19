@@ -314,9 +314,34 @@ class AdaptiveMap:
         n_low = segment_reduce((rel < 0.3).astype(np.float32), starts, "sum")
 
         ground_new = segment_percentile_sorted(z_sorted, starts, 10)
-        z_max_new = segment_percentile_sorted(
-            z_sorted, starts, 95, counts=n_band.astype(np.int64))
-        z_max_new = np.where(n_band > 0, z_max_new, ground_new)
+        # z_max is the TRUE maximum inside the clearance band, not a per-cell
+        # percentile.  Robustness belongs at the point level - the isolated
+        # return filter in S2 removes dust and rain before anything reaches
+        # here - because a per-cell percentile does not commute with taking
+        # the union of cells, and a map whose statistics cannot be aggregated
+        # exactly is worse than one that needed a noise filter anyway.
+        # max() commutes, so coarsening stays exact.
+        # A masked max, not a rank into the sorted array: `ground_z` varies
+        # between points inside one cell, so "inside the clearance band" is not
+        # a prefix of the sorted heights and a rank would pick the wrong point.
+        z_max_new = segment_reduce(
+            np.where(in_band, z, -np.inf), starts, "max")
+
+        # A cell whose ONLY returns are above the clearance band - tree canopy
+        # over a road, an overpass deck - contains no obstacle in the band, so
+        # both its ground and its z_max are the ground surface underneath.
+        # Falling back to the 10th percentile of z here instead put the canopy
+        # height into z_max, which then survived coarsening and made a cell
+        # that natively reads "clear road" read "3 m obstacle" once merged.
+        # The canopy belongs in overhead_clearance, and only there.
+        # The fallback must itself be exactly aggregable, since coarsening
+        # combines z_max with max(): max-of-maxes equals max-of-union, whereas
+        # mean-of-means does not, and the mismatch would show up as a
+        # millimetre-scale disagreement between a coarsened and a native map.
+        gnd_max = segment_reduce(g, starts, "max")
+        gnd_mean = segment_reduce(g, starts, "mean")
+        ground_new = np.where(n_band > 0, ground_new, gnd_mean)
+        z_max_new = np.where(n_band > 0, z_max_new, gnd_max)
 
         z_low = np.where(rel < 0.3, z, 0.0)
         c_low = np.maximum(n_low, 1.0)
@@ -371,10 +396,12 @@ class AdaptiveMap:
         old_clear = cells["overhead_clearance"][rows].astype(np.float32)
         cells["overhead_clearance"][rows] = _f16(
             np.where(fresh, clearance, np.minimum(old_clear, clearance)))
-        cells["n_points"][rows] = np.clip(tot, 0, 65535).astype(np.uint16)
-
         # Evidence: decode the stored top-3, add, re-encode.
+        # The decode scales by n_points, so it MUST happen before n_points is
+        # updated - otherwise every fusion silently re-weights the existing
+        # evidence by the incoming count.
         prior = self._decode_evidence(cells[rows])
+        cells["n_points"][rows] = np.clip(tot, 0, 65535).astype(np.uint16)
         self._encode_evidence(cells, rows, prior + ev_sum)
 
         cells["entropy"][rows] = _u8(e_max)
@@ -419,7 +446,10 @@ class AdaptiveMap:
         m, B = hist.shape
         occ = hist > 0
         z_of = HIST_Z0 + (np.arange(B) + 0.5) * HIST_BIN_M
-        band_bin = int((self.clearance_height - HIST_Z0) / HIST_BIN_M)
+        # ceil, not floor: the bin containing the clearance height straddles
+        # it, so flooring made every cell with a return at exactly 2.5 m report
+        # a clearance of 2.475 m and marked clear road BLOCKED.
+        band_bin = int(np.ceil((self.clearance_height - HIST_Z0) / HIST_BIN_M))
         band_bin = int(np.clip(band_bin, 1, B - 1))
 
         # Lowest occupied bin strictly above the clearance band.
@@ -456,8 +486,9 @@ class AdaptiveMap:
         out = np.zeros((m, NUM_CLASSES), np.float32)
         if m == 0:
             return out
+        # A never-written cell has n_points == 0 and must decode to zero
+        # evidence, not to one point's worth.
         scale = cells["n_points"].astype(np.float32)
-        scale = np.maximum(scale, 1.0)
         cls = cells["evidence_top3_cls"]
         val = cells["evidence_top3_val"].astype(np.float32) / 255.0
         # One bincount over a flattened (row, class) key: np.add.at is an
@@ -470,8 +501,14 @@ class AdaptiveMap:
                            minlength=m * NUM_CLASSES)
         out += flat[:m * NUM_CLASSES].reshape(m, NUM_CLASSES).astype(np.float32)
         resid = cells["evidence_residual"].astype(np.float32) / 255.0 * scale
-        # Spread the residual mass uniformly over the classes outside the top 3.
-        out += (resid / NUM_CLASSES)[:, None]
+        # Spread the residual over the classes OUTSIDE the top 3 only - adding
+        # it to all six would double-count the three whose mass is already
+        # stored explicitly.
+        outside = np.ones((m, NUM_CLASSES), np.float32)
+        valid_c = np.where(c < NUM_CLASSES, c, 0)
+        outside[rows, valid_c] = np.where(ok, 0.0, outside[rows, valid_c])
+        n_outside = np.maximum(outside.sum(axis=1), 1.0)
+        out += outside * (resid / n_outside)[:, None]
         return out
 
     @staticmethod
@@ -878,7 +915,11 @@ class AdaptiveMap:
             | (slope > profile.max_slope_deg * 0.6)
             | (step > profile.max_step_m * 0.6)
             | (cls == 1) | (cls == 5)
-            | (a["occupancy_state"] == Occupancy.UNKNOWN)
+            # Sparsely observed, not "occupancy unknown": a cell that holds
+            # points has been observed by definition, and the three-state
+            # occupancy describes free space, not surface confidence. Using it
+            # here marked almost every surface cell CAUTION.
+            | (a["n_points"] < 2)
         )
         verdict = np.where(blocked, Traversability.BLOCKED,
                            np.where(caution, Traversability.CAUTION,
@@ -921,8 +962,8 @@ class AdaptiveMap:
             soft.append(f"roughness {rough:.3f} > {profile.max_roughness:.3f}")
         if slope > profile.max_slope_deg * 0.6:
             soft.append(f"slope {slope:.1f}deg approaching limit")
-        if cell.occupancy_state == Occupancy.UNKNOWN:
-            soft.append("occupancy unknown")
+        if cell.n_points < 2:
+            soft.append(f"sparsely observed ({cell.n_points} point(s))")
         if cell.semantic_class in (1, 5):
             soft.append("rough / vegetated terrain")
         if soft:

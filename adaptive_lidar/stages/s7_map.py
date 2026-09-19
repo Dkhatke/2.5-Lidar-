@@ -52,6 +52,9 @@ class S7Map:
             static = getattr(frame, "static_mask", None)
             if static is None:
                 static = np.ones(n, bool)
+            noise = getattr(frame, "noise_mask", None)
+            if noise is not None and len(noise) == n:
+                static = static & ~noise
             sel = np.flatnonzero(static)
             if sel.size == 0:
                 return

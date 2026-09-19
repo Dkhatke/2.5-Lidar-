@@ -122,10 +122,17 @@ class S4Semantics:
             hag_max = np.zeros(m, np.float32)
             min_nbr = np.zeros(m, np.float32)
 
-        # THE GEOMETRIC SAFETY PIN: a run of >= 4 consecutive rings at one
-        # azimuth, standing above the ground, in a sparse neighbourhood.
-        # "Small, isolated, vertically extended" - without knowing what it is.
-        pin = (max_run >= 4) & (hag_max > 0.4) & (min_nbr < 40)
+        # THE GEOMETRIC SAFETY PIN: a run of >= 3 consecutive rings climbing
+        # at one azimuth, standing above the ground, in a sparse
+        # neighbourhood. "Small, isolated, vertically extended" - without
+        # knowing what the object is.
+        #
+        # Three rings, not four: that is the whole point. At 70 m a standing
+        # adult subtends exactly three beams, so a four-ring threshold excludes
+        # precisely the case the pin exists to protect. Near structure returns
+        # runs of 15-60 and clears any threshold; the far pedestrian is the
+        # marginal case, and the threshold has to be set for it.
+        pin = (max_run >= 3) & (hag_max > 0.4) & (min_nbr < 40)
 
         # Occlusion-aware density: how many real beams reached this tile.
         # Point count alone conflates "nothing is there" with "the view was

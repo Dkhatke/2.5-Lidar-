@@ -30,6 +30,7 @@ from adaptive_lidar.utils.grouping import (
     segment_reduce,
     segment_sort,
 )
+from adaptive_lidar.utils.range_image import isolated_return_mask
 from adaptive_lidar.utils.spatial_index import TILE_SIZE
 
 
@@ -52,6 +53,22 @@ class S2Geometry:
                 elev_angles_deg=getattr(frame, "_elev_angles_deg", None),
                 index=getattr(frame, "morton", None),
             )
+            # Isolated-return filter: low intensity AND few range-image
+            # neighbours at a similar range, i.e. dust or rain.  Deliberately
+            # NOT a generic statistical outlier filter, which deletes poles -
+            # poles are sparse and isolated by construction.
+            # The map's z_max is a true maximum (so that coarsening stays
+            # exact), which makes removing these points here rather than
+            # papering over them with a per-cell percentile the right place.
+            ri = getattr(frame, "_range_image", None)
+            if ri is not None and n:
+                noise = isolated_return_mask(ri, frame.intensity)
+                frame.noise_mask = noise
+                if noise.any():
+                    gmask = gmask & ~noise
+            else:
+                frame.noise_mask = np.zeros(n, bool)
+
             frame.ground_mask = gmask
             frame.non_ground_mask = ~gmask
             frame.ground_z = gz

@@ -144,7 +144,7 @@ def extract_features(frame) -> np.ndarray:
     if ri is not None:
         nrm, cos_i_img = range_image_normals(ri, pts)
         z_var_img, grad_img, planarity_img = local_window_stats(ri, pts, half=1)
-        run_img = vertical_run_lengths(ri)
+        run_img = vertical_run_lengths(ri, pts)
 
         # Lowest z inside the local window — a local ground reference that does
         # not depend on the global ground field.

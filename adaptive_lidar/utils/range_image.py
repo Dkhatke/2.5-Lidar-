@@ -175,40 +175,62 @@ def _azimuth_cols(points: np.ndarray, W: int) -> np.ndarray:
 # ────────────────────────────────────────────────────────────────
 def vertical_run_lengths(
     ri: RangeImage,
+    points: np.ndarray,
     range_tol: float = 0.35,
 ) -> np.ndarray:
-    """(H, W) length of the consecutive-ring run each pixel belongs to.
+    """(H, W) length of the consecutive-ring VERTICAL run each pixel is in.
 
     A thin vertical structure — a pole, a sign post, a standing person — is
     seen by several consecutive rings at essentially the same azimuth and
-    essentially the same range.  Ground, by contrast, changes range sharply
-    between rings (that is exactly what :func:`segment_ring_geometry` uses).
+    essentially the same range, AND the successive hits climb in z rather than
+    running outward along the ground.
+
+    Both conditions are necessary.  Testing range similarity alone fires on
+    near-field ground, where consecutive rings land only centimetres apart in
+    range: in a 70 m scan that marked more than half of all points as
+    "vertical structure", which makes the pin meaningless.  Requiring the
+    step between rings to be steeper than 45 degrees (|dz| > |d_rho|) is what
+    makes it a detector of vertical things rather than of nearby things.
 
     THIS IS THE GEOMETRIC SAFETY PIN.  It fires on "small, isolated,
-    vertically-extended cluster above ground" without knowing what the thing
+    vertically-extended cluster above ground" without knowing what the object
     is, so the retention guarantee survives a segmentation failure.
 
-    Pure column-wise scanning over the image: no loop over points.
+    Pure column-wise scanning over the image: a loop over 64 ROWS, never over
+    points.
     """
     H, W = ri.shape
-    same = (ri.valid[1:, :] & ri.valid[:-1, :]
-            & (np.abs(ri.rng[1:, :] - ri.rng[:-1, :]) < range_tol))
+    z = np.zeros((H, W), dtype=np.float32)
+    rho = np.zeros((H, W), dtype=np.float32)
+    v = ri.valid
+    idx = ri.index[v]
+    z[v] = points[idx, 2]
+    rho[v] = np.hypot(points[idx, 0], points[idx, 1])
+
+    dz = np.abs(z[1:, :] - z[:-1, :])
+    drho = np.abs(rho[1:, :] - rho[:-1, :])
+    dr = np.abs(ri.rng[1:, :] - ri.rng[:-1, :])
+
+    same = (v[1:, :] & v[:-1, :]
+            & (dr < range_tol)          # the two beams hit the same object
+            & (dz > drho))              # and the object rises rather than runs
 
     # Run length via a forward then backward cumulative pass over rows.
     up = np.zeros((H, W), dtype=np.int16)
-    for i in range(1, H):                       # H = 64 — a loop over ROWS, not points
+    for i in range(1, H):               # H = 64 — a loop over ROWS, not points
         up[i] = np.where(same[i - 1], up[i - 1] + 1, 0)
     down = np.zeros((H, W), dtype=np.int16)
     for i in range(H - 2, -1, -1):
         down[i] = np.where(same[i], down[i + 1] + 1, 0)
-    return (up + down + 1).astype(np.int16) * ri.valid
+    return (up + down + 1).astype(np.int16) * v
 
 
 def _box_sum(a: np.ndarray, half: int) -> np.ndarray:
-    """Separable (2*half+1)^2 box sum, wrapping in azimuth and clamping in ring.
+    """Separable (2*half+1)^2 box sum, wrapping in azimuth, clamping in ring.
 
     Azimuth wraps because the scan is a full rotation; rings do not, so the
-    edge rows simply see a smaller window.
+    edge rows simply see a smaller window. Two 1-D passes rather than
+    (2*half+1)^2 whole-image shifts.
     """
     out = a.copy()
     for k in range(1, half + 1):                 # azimuth: wrap
