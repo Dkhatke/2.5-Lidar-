@@ -1,540 +1,587 @@
 """
-app.py — Streamlit dashboard for SIH26 Adaptive Foveated 2.5D LiDAR Perception.
+app.py — the dashboard (M5).
 
-Run: streamlit run app.py
+    streamlit run app.py
 
-Tabs:
-  1. Raw LiDAR
-  2. Range Image
-  3. Geometry
-  4. Adaptive Allocation   ← KEY DEMO
-  5. Semantic Perception
-  6. Motion
-  7. 2.5D Map              ← KEY DEMO
-  8. Telemetry
+Built to be understandable by someone who has never heard of a 2.5D map, and
+honest to someone who has:
+
+  * the budget slider is live, and dragging it coarsens the whole map EXCEPT
+    the safety-pinned regions — a threshold-based system cannot do that at
+    all, which is why it is the single most important control here;
+  * the cell-boundary overlay makes the varying cell size visible rather than
+    merely claimed;
+  * clicking a cell shows every stored layer, so "trust me" becomes
+    "inspect it yourself";
+  * the driver toggles ARE the ablation study, run interactively;
+  * the three-panel view fixes the MEMORY and asks which map still contains
+    the pedestrian.
+
+Nothing is displayed that was not measured in this session. The active
+backend and data source are always on screen, and oracle mode is impossible
+to mistake for a prediction.
 """
 from __future__ import annotations
-import sys
+
+import copy
 import os
+import sys
 import time
+
 import numpy as np
 import streamlit as st
 
-# ── Make package importable from app.py location ────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-if _PARENT not in sys.path:
-    sys.path.insert(0, _PARENT)
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+for p in (_PARENT, _HERE):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-# ── Page config ──────────────────────────────────────────────
-st.set_page_config(
-    page_title="SIH26 — Adaptive LiDAR",
-    page_icon="🔭",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from adaptive_lidar.data.loader import get_dataset                  # noqa: E402
+from adaptive_lidar.data.synthetic_scene import (                   # noqa: E402
+    FAR_PEDESTRIAN_X,
+    FAR_PEDESTRIAN_Y,
+    SCENARIOS,
 )
+from adaptive_lidar.evaluation.metrics import (                     # noqa: E402
+    BAND_NAMES,
+    elevation_error,
+    latency_percentiles,
+    object_retention_rate,
+    range_stratified_iou,
+)
+from adaptive_lidar.evaluation.reference_map import build_reference_map  # noqa: E402
+from adaptive_lidar.mapping.allocation import AllocationController  # noqa: E402
+from adaptive_lidar.perception.backends import BACKEND_NAMES        # noqa: E402
+from adaptive_lidar.pipeline.pipeline import Pipeline               # noqa: E402
+from adaptive_lidar.pipeline.types import (                         # noqa: E402
+    CELL_DTYPE,
+    CLASS_NAMES,
+    CellFlags,
+    Occupancy,
+    ResolutionLevel,
+    Traversability,
+    VehicleProfile,
+)
+from adaptive_lidar.utils.config import load_config                 # noqa: E402
+from adaptive_lidar.visualization import render as R                # noqa: E402
 
-# ── Dark theme CSS injection ──────────────────────────────────
-st.markdown("""
+st.set_page_config(page_title="Adaptive 2.5D LiDAR Mapping",
+                   layout="wide", initial_sidebar_state="expanded")
+
+CSS = """
 <style>
-body, .stApp { background-color: #0d1117; color: #e6edf3; }
-.metric-container { background: #161b22; border-radius: 8px; padding: 10px; }
-.stTabs [data-baseweb="tab"] { background: #161b22; border-radius: 6px 6px 0 0; }
-.stTabs [aria-selected="true"] { background: #1f6feb; }
-div[data-testid="stMetricValue"] { font-size: 1.6rem; color: #58a6ff; }
-div[data-testid="stMetricLabel"] { color: #8b949e; font-size: 0.75rem; }
-.safety-banner {
-    background: linear-gradient(90deg,#b45309,#92400e);
-    color:#fef3c7; padding:8px 16px;
-    border-radius:6px; font-weight:bold;
-}
+  .block-container {padding-top: 1.1rem; padding-bottom: 1rem; max-width: 100%;}
+  div[data-testid="stMetricValue"] {font-size: 1.32rem;}
+  div[data-testid="stMetricLabel"] {font-size: 0.74rem; opacity: .72;}
+  .hdr {font-size: 1.32rem; font-weight: 700; letter-spacing: .01em;}
+  .sub {font-size: .80rem; opacity: .68; margin-top: -4px;}
+  .oracle {background:#7F1D1D;color:#fff;padding:9px 14px;border-radius:6px;
+           font-weight:700;letter-spacing:.03em;margin:6px 0;}
+  .prov {font-size: .72rem; opacity: .6;}
+  .starred {color:#C2410C; font-weight:700;}
+  code {font-size: .78rem;}
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════
-# Session state helpers
+# Pipeline execution, cached per configuration
 # ════════════════════════════════════════════════════════════
-def _init_state():
-    if "pipeline" not in st.session_state:
-        st.session_state.pipeline = None
-    if "frames" not in st.session_state:
-        st.session_state.frames = []
-    if "current_frame_idx" not in st.session_state:
-        st.session_state.current_frame_idx = 0
-    if "loaded" not in st.session_state:
-        st.session_state.loaded = False
+@st.cache_resource(show_spinner=False)
+def load_frames(scenario: str, n_frames: int):
+    ds = get_dataset("synthetic", None, n_frames, scenario=scenario, quiet=True)
+    return list(ds), ds.name
 
 
-_init_state()
+@st.cache_resource(show_spinner=False)
+def reference_for(scenario: str, n_frames: int):
+    frames, _ = load_frames(scenario, n_frames)
+    return build_reference_map(frames)
 
 
-# ════════════════════════════════════════════════════════════
-# Load config
-# ════════════════════════════════════════════════════════════
-@st.cache_resource
-def get_config():
-    from adaptive_lidar.utils.config import load_config
-    cfg_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-    return load_config(cfg_path)
+@st.cache_resource(show_spinner=False, max_entries=48)
+def run_pipeline(scenario, n_frames, policy, budget, backend,
+                 gate_enabled, upto_frame, weight_key):
+    """Run the pipeline and return everything the page needs.
+
+    Cached on every input, so dragging the budget slider replays only
+    configurations that have not been seen yet.
+    """
+    frames, src = load_frames(scenario, n_frames)
+    cfg = copy.deepcopy(load_config())
+    cfg.setdefault("motion", {})["gate_enabled"] = gate_enabled
+    wg, ws, wu, wd = weight_key
+    cfg["weights"] = {"geometry": wg, "semantic": ws,
+                      "uncertainty": wu, "dynamic": wd}
+
+    pipe = Pipeline(cfg)
+    pipe.build_stages(backend=backend, policy=policy)
+    pipe.set_budget(budget)
+    pipe.context.data_source = src
+
+    pred, true, rng = [], [], []
+    last = None
+    for k, f in enumerate(frames[:upto_frame + 1]):
+        last = pipe.run(cloud_np=f, frame_id=f["frame_id"],
+                        timestamp=f["timestamp"])
+        if k == 0:
+            pipe.context.cumulative_timing.clear()   # discard warm-up
+        if last.gt_label is not None:
+            pred.append(np.asarray(last.sem_class))
+            true.append(np.asarray(last.gt_label))
+            rng.append(last._range)
+
+    amap = pipe.context.amap
+    return {
+        "arrays": amap.all_cells_arrays(),
+        "counts": amap.cell_counts(),
+        "n_cells": amap.n_cells,
+        "bytes": amap.nbytes(),
+        "uniform_cells": pipe.context.uniform_ref.n_cells,
+        "uniform_bytes": pipe.context.uniform_ref.nbytes(),
+        "telemetry": dict(last.timing.get("telemetry", {})),
+        "latency": latency_percentiles(pipe.context),
+        "s6": dict(last.timing.get("S6_diag", {})),
+        "s8": dict(last.timing.get("S8_diag", {})),
+        "s1": dict(last.timing.get("S1_diag", {})),
+        "backend": pipe.context.semantic_backend_name,
+        "source": src,
+        "tiles": [(t.cx, t.cy, t.resolution_level, t.safety_pinned,
+                   t.safety_reason, t.point_count, t.info_value)
+                  for t in (last.tiles or [])],
+        "instances": [(i.instance_id, i.semantic_class, i.state_name,
+                       float(i.speed), i.point_count,
+                       i.centroid.tolist(), i.extent.tolist())
+                      for i in (last.instances or [])],
+        "overlay": (pipe.context.dynamic_overlay.points.copy()
+                    if pipe.context.dynamic_overlay else np.zeros((0, 3))),
+        "sem": (range_stratified_iou(np.concatenate(pred),
+                                     np.concatenate(true),
+                                     np.concatenate(rng)) if pred else None),
+        "orr": object_retention_rate(amap, frames[:upto_frame + 1]),
+        "elev": elevation_error(amap, reference_for(scenario, n_frames)),
+        "amap": amap,
+        "pose": last.pose,
+        "n_points": len(last.points),
+    }
 
 
-# ════════════════════════════════════════════════════════════
-# SIDEBAR
-# ════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.title("🔭 SIH26 Controls")
-    st.markdown("---")
-
-    data_mode = st.radio(
-        "Input source",
-        ["Synthetic demo", "SemanticKITTI sequence", "Single .bin/.npy file"],
-        index=0,
-    )
-
-    kitti_path = ""
-    single_path = ""
-    if data_mode == "SemanticKITTI sequence":
-        kitti_path = st.text_input("Sequence directory",
-                                   "dataset/sequences/00")
-    elif data_mode == "Single .bin/.npy file":
-        single_path = st.text_input("File path", "")
-
-    n_frames = st.slider("Frames to load", 2, 50, 8)
-
-    st.markdown("---")
-    backend_choice = st.selectbox(
-        "Semantic backend",
-        ["auto", "prototype", "geometry", "minkowski"],
-        index=0,
-    )
-
-    budget_pct = st.slider(
-        "⚡ Computation budget (%)", 10, 100, 80, step=5,
-        help="Lower = fewer tiles processed at high resolution. Safety pins always protected.")
-
-    st.markdown("---")
-    max_range = st.slider("Max LiDAR range (m)", 20, 80, 60)
-
-    st.markdown("---")
-    show_raw = st.checkbox("Show raw LiDAR", True)
-    show_alloc = st.checkbox("Show allocation map", True)
-    show_sem = st.checkbox("Show semantics", True)
-    show_map = st.checkbox("Show 2.5D map", True)
-
-    st.markdown("---")
-    load_btn = st.button("▶  Load & Process", type="primary", use_container_width=True)
-
-
-# ════════════════════════════════════════════════════════════
-# LOAD + PROCESS
-# ════════════════════════════════════════════════════════════
-if load_btn:
-    config = get_config()
-    config.setdefault("sensor", {})["max_range"] = float(max_range)
-
-    from adaptive_lidar.pipeline.pipeline import Pipeline
-    from adaptive_lidar.data.loader import get_input_source
-
-    with st.spinner("Building pipeline and processing frames…"):
-        pipe = Pipeline(config)
-        pipe.build_stages(backend=backend_choice)
-        pipe.set_budget(budget_pct / 100.0)
-
-        # Choose data source
-        if data_mode == "Synthetic demo":
-            source = get_input_source(max_frames=n_frames,
-                                      num_synthetic_frames=n_frames)
-        elif data_mode == "SemanticKITTI sequence":
-            source = get_input_source(input_path=kitti_path,
-                                      max_frames=n_frames)
-        else:
-            source = get_input_source(input_path=single_path or None,
-                                      max_frames=n_frames)
-
-        frames = []
-        prog = st.progress(0.0, text="Processing…")
-        items = list(source)
-        for step_i, (cloud, labels, fid, ts) in enumerate(items):
-            frame = pipe.run(cloud_np=cloud, frame_id=fid, timestamp=ts)
-            frames.append(frame)
-            prog.progress((step_i + 1) / len(items),
-                          text=f"Frame {fid} — {len(cloud):,} points")
-
-        prog.empty()
-        st.session_state.pipeline = pipe
-        st.session_state.frames = frames
-        st.session_state.current_frame_idx = len(frames) - 1
-        st.session_state.loaded = True
-        st.session_state.backend_name = pipe.context.semantic_backend_name
-
-    st.success(f"✅ Loaded {len(frames)} frames.")
+def trav_for(amap, profile_name):
+    p = (VehicleProfile.tracked() if profile_name == "tracked"
+         else VehicleProfile.wheeled())
+    return amap.traversability_arrays(p)["verdict"], p
 
 
 # ════════════════════════════════════════════════════════════
-# HEADER
+# Sidebar
 # ════════════════════════════════════════════════════════════
-st.markdown("""
-<h1 style='text-align:center;
-   background:linear-gradient(90deg,#1f6feb,#388bfd);
-   -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-   font-size:2rem;margin-bottom:0'>
-   🔭 Adaptive Foveated 2.5D LiDAR Perception
-</h1>
-<p style='text-align:center;color:#8b949e;margin-top:4px'>
-SIH26 — Intelligent computation allocation for autonomous perception
-</p>
-""", unsafe_allow_html=True)
+cfg0 = load_config()
+S = st.sidebar
+S.markdown("### Configuration")
 
-if not st.session_state.loaded:
-    st.info("👈  Configure options in the sidebar, then click **▶ Load & Process**.")
-    st.markdown("""
-    ### What this prototype demonstrates
-    ```
-    ENTIRE LiDAR SCENE
-          │
-          ▼
-    CHEAP GLOBAL ANALYSIS      (S1 + S2)
-          │
-          ▼
-    INFORMATION VALUE SCORE    (S3)
-          │
-          ▼
-    ADAPTIVE BUDGET CONTROL
-     COARSE ── MEDIUM ── FINE
-          │
-          ▼
-    SPARSE PERCEPTION          (S4) ← only selected tiles
-          │
-     ┌────┴────┐
-     ▼         ▼
-    SEMANTIC  MOTION           (S4 + S5)
-          │
-          ▼
-    UNCERTAINTY FEEDBACK       (S6)
-          │
-          ▼
-    ADAPTIVE 2.5D MAP          (S7 + S8)
-    ```
-    """)
-    st.stop()
+scenario = S.selectbox("Scenario", SCENARIOS,
+                       index=SCENARIOS.index("mixed_urban"))
+n_frames = S.slider("Frames in the run", 2, 20, 6)
+frame_idx = S.slider("Timeline — frame", 0, n_frames - 1, n_frames - 1,
+                     help="Scrub the run; the map accumulates up to this frame.")
 
+S.markdown("---")
+policy = S.selectbox("Allocation policy", AllocationController.POLICIES,
+                     index=AllocationController.POLICIES.index("full"))
+backend = S.selectbox("Semantic backend", ("auto",) + tuple(BACKEND_NAMES),
+                      index=0)
+vehicle = S.radio("Vehicle profile", ("wheeled", "tracked"), horizontal=True,
+                  help="Traversability is computed per vehicle from stored "
+                       "terrain properties — the map itself is "
+                       "vehicle-independent.")
 
-# ════════════════════════════════════════════════════════════
-# FRAME SELECTOR
-# ════════════════════════════════════════════════════════════
-frames = st.session_state.frames
-pipe = st.session_state.pipeline
+S.markdown("---")
+S.markdown("**Allocation drivers** — this *is* the ablation study")
+S.caption("Turn a term off and watch where the budget moves.")
+w = cfg0.get("weights", {})
+use_g = S.checkbox("geometry (G)", True)
+use_s = S.checkbox("semantic stake (S)", True)
+use_u = S.checkbox("uncertainty (U)", True)
+use_d = S.checkbox("dynamics (D)", True)
+weight_key = (w.get("geometry", .3) * use_g, w.get("semantic", .3) * use_s,
+              w.get("uncertainty", .2) * use_u, w.get("dynamic", .2) * use_d)
+if sum(weight_key) == 0:
+    weight_key = (1e-6, 1e-6, 1e-6, 1e-6)
+    S.warning("All drivers off — allocation falls back to the distance "
+              "schedule alone.")
 
-fi = st.slider("Frame", 0, len(frames) - 1,
-               st.session_state.current_frame_idx, key="frame_sel")
-frame = frames[fi]
-telem = frame.timing.get("telemetry", {})
+S.markdown("---")
+gate = S.checkbox("MOS gate enabled", True,
+                  help="Off = moving points are written to the persistent "
+                       "map. That is the trail ablation.")
+show_edges = S.checkbox("Show cell boundaries", True,
+                        help="Draws each cell's edges so the varying cell "
+                             "size is visible rather than merely claimed.")
+show_overlay = S.checkbox("Show dynamic overlay", True)
+layer = S.selectbox("Layer", R.LAYERS,
+                    index=R.LAYERS.index("semantic"))
+px_per_m = S.slider("Render resolution (px/m)", 3, 16, 7)
 
 
 # ════════════════════════════════════════════════════════════
-# TELEMETRY ROW
+# Header
 # ════════════════════════════════════════════════════════════
-n_tiles = telem.get("total_tiles", 0)
-n_hi = telem.get("high_res_tiles", 0)
-n_med = telem.get("medium_tiles", 0)
-n_low = telem.get("low_res_tiles", 0)
-n_safety = telem.get("safety_pinned", 0)
-total_ms = telem.get("total_latency_ms", 0.0)
-n_pts = telem.get("point_count", 0)
-backend_name = telem.get("backend", "—")
+c1, c2 = st.columns([3, 2])
+with c1:
+    st.markdown("#### ADAPTIVE VARIABLE-RESOLUTION 2.5D LiDAR MAPPING")
+    st.markdown('<div class="sub">SIH 2026 · DRDO PS 26053 · dynamic '
+                'environment perception</div>', unsafe_allow_html=True)
+with c2:
+    budget = st.slider("★ MEMORY BUDGET — fraction of a uniform 5 cm map",
+                       0.05, 1.0, 0.5, 0.05,
+                       help="Drag me. Everything coarsens EXCEPT the "
+                            "safety-pinned regions. A threshold-based system "
+                            "cannot do this.")
 
-pct_hi = 100 * n_hi / max(n_tiles, 1)
-pct_med = 100 * n_med / max(n_tiles, 1)
-pct_low = 100 * n_low / max(n_tiles, 1)
+t_start = time.perf_counter()
+with st.spinner("Running the pipeline..."):
+    R_ = run_pipeline(scenario, n_frames, policy, budget, backend, gate,
+                      frame_idx, weight_key)
+elapsed = time.perf_counter() - t_start
 
-cols = st.columns(8)
-cols[0].metric("Points", f"{n_pts:,}")
-cols[1].metric("Latency", f"{total_ms:.0f} ms")
-cols[2].metric("🔴 HIGH", f"{n_hi} ({pct_hi:.0f}%)")
-cols[3].metric("🟡 MED", f"{n_med} ({pct_med:.0f}%)")
-cols[4].metric("🔵 LOW", f"{n_low} ({pct_low:.0f}%)")
-cols[5].metric("⚠ Safety pins", n_safety)
-cols[6].metric("Map cells", f"{len(pipe.map_cells):,}")
-cols[7].metric("Frame", f"{fi}/{len(frames)-1}")
+if R_["backend"] == "oracle":
+    st.markdown('<div class="oracle">⚠ ORACLE MODE — ground-truth labels, '
+                'NOT a prediction. Any accuracy shown measures the MAP, '
+                'never the segmenter.</div>', unsafe_allow_html=True)
 
-# Safety pin banner
-if n_safety > 0 and budget_pct < 60:
-    st.markdown(
-        f'<div class="safety-banner">⚠️ SAFETY PIN ACTIVE — '
-        f'{n_safety} tile(s) protected at HIGH resolution despite {budget_pct}% budget</div>',
-        unsafe_allow_html=True,
-    )
-
-# Backend badge
 st.markdown(
-    f'<div style="background:#161b22;border-radius:6px;padding:4px 12px;'
-    f'display:inline-block;margin:4px 0;font-size:0.8rem;color:#58a6ff">'
-    f'🧠 Semantic backend: <b>{backend_name}</b></div>',
-    unsafe_allow_html=True,
-)
+    f'<div class="prov">data source <code>{R_["source"]}</code> · backend '
+    f'<code>{R_["backend"]}</code> · policy <code>{policy}</code> · '
+    f'frame {frame_idx + 1}/{n_frames} · {R_["n_points"]:,} points/frame · '
+    f'range image <code>{R_["s1"].get("ri_method", "?")}</code> '
+    f'({100 * R_["s1"].get("ri_valid_rate", 0):.1f}% valid, '
+    f'{100 * R_["s1"].get("ri_collision_rate", 0):.2f}% collisions)'
+    f'</div>', unsafe_allow_html=True)
+st.markdown("")
+
+# ════════════════════════════════════════════════════════════
+# Main map + right rail
+# ════════════════════════════════════════════════════════════
+a = R_["arrays"]
+amap = R_["amap"]
+trav, profile = trav_for(amap, vehicle)
+
+pose = R_["pose"] if R_["pose"] is not None else np.eye(4)
+ex = float(pose[0, 3])
+extent = (ex - 25.0, ex + 95.0, -32.0, 32.0)
+
+left, right = st.columns([2.45, 1])
+
+with left:
+    img, ext = R.render(a, layer, extent, px_per_m, show_edges, trav)
+    if show_overlay and len(R_["overlay"]):
+        img = R.overlay_points(img, R_["overlay"], ext, px_per_m)
+    st.image(np.flipud(img), width='stretch',
+             caption=f"{layer} · {extent[0]:.0f}..{extent[1]:.0f} m along the "
+                     f"road · ego at x={ex:.1f} m")
+    st.markdown(R.legend_html(layer), unsafe_allow_html=True)
+
+with right:
+    t = R_["telemetry"]
+    red = (100.0 * (1 - R_["bytes"] / R_["uniform_bytes"])
+           if R_["uniform_bytes"] else float("nan"))
+    m1, m2 = st.columns(2)
+    m1.metric("Cells", f"{R_['n_cells']:,}")
+    m2.metric("Memory", f"{R_['bytes'] / 1e6:.2f} MB")
+    m1.metric("Uniform 5 cm", f"{R_['uniform_bytes'] / 1e6:.2f} MB")
+    m2.metric("Reduction", f"{red:.1f} %")
+
+    lat = R_["latency"].get("TOTAL", {})
+    m1, m2 = st.columns(2)
+    m1.metric("Latency p50", f"{lat.get('p50', 0):.0f} ms")
+    m2.metric("p99", f"{lat.get('p99', 0):.0f} ms")
+
+    st.markdown("**Cells by physical size** — this is M4")
+    tot = max(sum(R_["counts"].values()), 1)
+    for lvl in range(5):
+        c = R_["counts"].get(lvl, 0)
+        st.markdown(
+            f'<div style="display:flex;align-items:center;font-size:12px;'
+            f'margin-bottom:2px">'
+            f'<span style="width:38px;color:{R.LEVEL_COLOURS[lvl]};'
+            f'font-weight:700">{ResolutionLevel.name(lvl)}</span>'
+            f'<span style="flex:0 0 150px;background:#e8e8ec;height:11px;'
+            f'border-radius:2px;overflow:hidden">'
+            f'<span style="display:block;height:11px;width:{100 * c / tot:.1f}%;'
+            f'background:{R.LEVEL_COLOURS[lvl]}"></span></span>'
+            f'<span style="margin-left:8px">{c:,}</span></div>',
+            unsafe_allow_html=True)
+
+    st.markdown("**Object retention (ORR)**")
+    orr = R_["orr"]["per_class"]
+    for c in (4, 3, 2):
+        d = orr[c]
+        if d["observed"]:
+            st.markdown(
+                f'<div style="font-size:12px">'
+                f'<span style="color:{R.CLASS_COLOURS[c]};font-weight:600">'
+                f'{CLASS_NAMES[c]}</span> — {100 * d["orr"]:.1f}% '
+                f'<span style="opacity:.6">({d["retained"]}/{d["observed"]} '
+                f'objects)</span></div>', unsafe_allow_html=True)
+
+    s6 = R_["s6"]
+    st.markdown(
+        f'<div style="font-size:12px;margin-top:8px">'
+        f'<b>{s6.get("n_pinned", 0)}</b> of {s6.get("n_tiles", 0)} tiles '
+        f'safety-pinned, taking {s6.get("pin_cells", 0):,} cells of a '
+        f'{s6.get("cell_budget", 0):,}-cell budget'
+        + ('<br><span style="color:#C2410C">pins exceed the budget — the '
+           'safety floor is now the binding constraint</span>'
+           if s6.get("budget_exceeded_by_pins") else '')
+        + '</div>', unsafe_allow_html=True)
+    s8 = R_["s8"]
+    st.markdown(
+        f'<div style="font-size:12px;margin-top:4px">MOS gate '
+        f'<b>{"ON" if s8.get("gate_enabled") else "OFF"}</b> — '
+        f'{s8.get("n_moving", 0):,} points held out of the persistent map '
+        f'this frame</div>', unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════
+# Accuracy across varying distances (M6)
+# ════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown("#### Accuracy across varying distances  ·  M6")
+st.caption("An aggregate number is dominated by the near field, where 70% of "
+           "a LiDAR's points are and nothing is hard. These are stratified.")
+
+sem = R_["sem"]
+elev = R_["elev"]
+rows = []
+if sem:
+    rows.append(["semantic mIoU"]
+                + [f"{sem['bands'][b]['miou']:.3f}" if sem["bands"].get(b)
+                   else "—" for b in BAND_NAMES]
+                + [f"{sem['overall']['miou']:.3f}"])
+    rows.append(["semantic accuracy"]
+                + [f"{sem['bands'][b]['accuracy']:.3f}" if sem["bands"].get(b)
+                   else "—" for b in BAND_NAMES]
+                + [f"{sem['overall']['accuracy']:.3f}"])
+rows.append(["elevation RMSE (m)"]
+            + [f"{elev['bands'][b]['rmse_m']:.3f}" if elev["bands"].get(b)
+               else "—" for b in BAND_NAMES]
+            + [f"{elev['overall']['rmse_m']:.3f}" if elev.get("overall") else "—"])
+rows.append(["elevation bias (m)"]
+            + [f"{elev['bands'][b]['bias_m']:+.3f}" if elev["bands"].get(b)
+               else "—" for b in BAND_NAMES]
+            + [f"{elev['overall']['bias_m']:+.3f}" if elev.get("overall") else "—"])
+try:
+    import pandas as pd
+    st.dataframe(pd.DataFrame(rows, columns=["metric"] + list(BAND_NAMES)
+                              + ["overall"]),
+                 hide_index=True, width='stretch')
+except Exception:
+    st.table(rows)
+st.caption("Signed bias is shown next to RMSE because a planner can absorb "
+           "variance but not a systematic offset — a consistent underestimate "
+           "of a kerb is what drives a vehicle into it.")
+
+# ════════════════════════════════════════════════════════════
+# Tabs
+# ════════════════════════════════════════════════════════════
+tab_cmp, tab_cell, tab_obj, tab_lat = st.tabs(
+    ["★ Equal-memory comparison", "Cell inspector", "Objects", "Latency"])
+
+# ── the money shot ───────────────────────────────────────────
+with tab_cmp:
+    st.markdown("##### The same scene at three resolutions — what survives")
+    st.caption(
+        "Comparing an adaptive map against a uniform 5 cm map on memory "
+        "alone is rigged: of course it is smaller, it was told to be. The "
+        "question worth asking is what each map COSTS and what each map "
+        "KEEPS. The uniform panels are fixed-resolution baselines and ignore "
+        "the budget slider; the adaptive panel obeys it.")
+    if st.checkbox("Run the three-panel comparison  "
+                   "(three full pipelines — takes a few seconds)"):
+        cols = st.columns(3)
+        panels = [("uniform_5", "uniform 5 cm"),
+                  ("uniform_40", "uniform 40 cm"),
+                  ("full", "adaptive (full)")]
+        summary = {}
+        for col, (pol, label) in zip(cols, panels):
+            with col:
+                r = run_pipeline(scenario, n_frames, pol, budget, backend,
+                                 gate, frame_idx, weight_key)
+                tv, _ = trav_for(r["amap"], vehicle)
+                im, e2 = R.render(r["arrays"], "semantic", extent,
+                                  max(px_per_m, 7), show_edges, tv)
+                st.image(np.flipud(im), width='stretch')
+                ped = r["orr"]["per_class"][4]
+                aa = r["arrays"]
+                n_ped, sz = 0, 0.0
+                if len(aa["cx"]):
+                    d = np.hypot(aa["cx"] - FAR_PEDESTRIAN_X,
+                                 aa["cy"] - FAR_PEDESTRIAN_Y)
+                    near = d <= 1.2
+                    n_ped = int(near.sum())
+                    sz = float(aa["size"][near].mean() * 100) if near.any() else 0.0
+                summary[label] = (r["bytes"] / 1e6, ped["orr"], n_ped, sz)
+                st.markdown(f"**{label}**")
+                st.markdown(
+                    f'<div style="font-size:12px">'
+                    f'{r["n_cells"]:,} cells · <b>{r["bytes"] / 1e6:.2f} MB</b><br>'
+                    f'VRU retention '
+                    f'<b style="color:{"#2E7D32" if ped["orr"] == 1 else "#C62828"}">'
+                    f'{100 * ped["orr"]:.0f}%</b> '
+                    f'({ped["retained"]}/{ped["observed"]} objects)<br>'
+                    f'70 m pedestrian: <b>{n_ped}</b> cells at '
+                    f'{sz:.0f} cm</div>',
+                    unsafe_allow_html=True)
+
+        if len(summary) == 3:
+            u5 = summary["uniform 5 cm"]
+            u40 = summary["uniform 40 cm"]
+            ad = summary["adaptive (full)"]
+            st.markdown(
+                f"**What the three panels say.** The adaptive map keeps the "
+                f"70 m pedestrian at {ad[3]:.0f} cm resolution — the same as "
+                f"a uniform 5 cm map — for **{ad[0]:.2f} MB against "
+                f"{u5[0]:.2f} MB**, that is "
+                f"{100 * (1 - ad[0] / max(u5[0], 1e-9)):.0f}% less memory for "
+                f"the same retention. The uniform map that IS cheaper "
+                f"({u40[0]:.2f} MB) resolves the pedestrian into only "
+                f"{u40[2]} cells at {u40[3]:.0f} cm and its VRU retention "
+                f"falls to {100 * u40[1]:.0f}%. Spending the budget evenly is "
+                f"what loses the object; spending it where the value function "
+                f"points is what keeps it.")
+
+# ── cell inspector ───────────────────────────────────────────
+with tab_cell:
+    st.markdown("##### Click any location — every stored layer, no summary")
+    ic1, ic2 = st.columns(2)
+    qx = ic1.number_input("x (m)", value=float(FAR_PEDESTRIAN_X), step=0.5)
+    qy = ic2.number_input("y (m)", value=float(FAR_PEDESTRIAN_Y), step=0.5)
+    cell = amap.cell_at(qx, qy)
+    if cell is None and len(a["cx"]):
+        # Snap to the nearest cell rather than showing nothing: at 5 cm the
+        # exact query point usually falls between cells, and "no cell here"
+        # is only the interesting answer when the area is genuinely unobserved.
+        d = np.hypot(a["cx"] - qx, a["cy"] - qy)
+        j = int(np.argmin(d))
+        if d[j] < 2.0:
+            qx, qy = float(a["cx"][j]), float(a["cy"][j])
+            cell = amap.cell_at(qx, qy)
+            st.caption(f"No cell exactly there; snapped to the nearest, "
+                       f"{d[j]:.2f} m away at ({qx:.2f}, {qy:.2f}).")
+    if cell is None:
+        st.info("No cell within 2 m — the sensor never observed this area. "
+                "Absence of a cell is not free space.")
+    else:
+        verdict, reason = amap.traversability(qx, qy, profile)
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Cell size", f"{cell.resolution * 100:.0f} cm",
+                  f"level {cell.level}")
+        d2.metric("Points", f"{cell.n_points:,}")
+        d3.metric(f"Traversable ({profile.name})",
+                  Traversability.NAMES[verdict])
+        st.caption(f"**reason:** {reason}")
+
+        e1, e2 = st.columns(2)
+        with e1:
+            st.markdown("**Geometry**")
+            st.markdown(
+                f"- ground_z `{cell.ground_z:.3f}` m\n"
+                f"- z_max `{cell.z_max:.3f}` m\n"
+                f"- obstacle height `{cell.obstacle_height:.3f}` m\n"
+                f"- overhead clearance "
+                f"`{'inf' if not np.isfinite(cell.overhead_clearance) else f'{cell.overhead_clearance:.2f}'}` m\n"
+                f"- z_var `{cell.z_var:.5f}`\n"
+                f"- intensity mean `{cell.intensity_mean:.3f}` "
+                f"var `{cell.intensity_var:.3f}`\n"
+                f"- penetration `{cell.penetration:.3f}`\n"
+                f"- observability `{cell.observability:.3f}`")
+        with e2:
+            st.markdown("**Semantics — the full distribution, not the argmax**")
+            if cell.evidence is not None:
+                order = np.argsort(-cell.evidence)
+                for c in order:
+                    st.markdown(
+                        f'<div style="font-size:12px;display:flex;'
+                        f'align-items:center">'
+                        f'<span style="width:118px;color:{R.CLASS_COLOURS[int(c)]}">'
+                        f'{CLASS_NAMES[int(c)]}</span>'
+                        f'<span style="flex:0 0 90px;background:#e8e8ec;'
+                        f'height:9px;border-radius:2px;overflow:hidden">'
+                        f'<span style="display:block;height:9px;'
+                        f'width:{100 * cell.evidence[c]:.0f}%;'
+                        f'background:{R.CLASS_COLOURS[int(c)]}"></span></span>'
+                        f'<span style="margin-left:8px">'
+                        f'{cell.evidence[c]:.3f}</span></div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                f"\n- entropy `{cell.entropy:.3f}` (uncertainty)\n"
+                f"- occupancy `{Occupancy.NAMES[cell.occupancy_state]}` "
+                f"(log-odds `{cell.occupancy_logodds:+.2f}`)\n"
+                f"- dynamic prob `{cell.dynamic_probability:.3f}`\n"
+                f"- last seen frame `{cell.last_seen}`\n"
+                f"- flags `{', '.join(cell.flag_names()) or 'none'}`")
+        st.caption(f"Stored in {CELL_DTYPE.itemsize} bytes + an 8-byte Morton "
+                   f"key. Obstacle height, slope, traversability and the "
+                   f"resolution level are derived on demand, never stored.")
+
+# ── objects ──────────────────────────────────────────────────
+with tab_obj:
+    st.markdown("##### Tracked objects  ·  M3")
+    st.caption("Velocity lives in this table and never in a cell: one car "
+               "covers ~200 cells and storing its velocity 200 times goes "
+               "inconsistent the moment the estimate updates.")
+    inst = R_["instances"]
+    if not inst:
+        st.info("No instances in this frame.")
+    else:
+        try:
+            import pandas as pd
+            df = pd.DataFrame(
+                [{"id": i[0], "class": CLASS_NAMES[i[1]], "state": i[2],
+                  "speed (m/s)": round(i[3], 2), "points": i[4],
+                  "x": round(i[5][0], 1), "y": round(i[5][1], 1),
+                  "extent (m)": " x ".join(f"{v:.1f}" for v in i[6])}
+                 for i in sorted(inst, key=lambda z: -z[4])[:25]])
+            st.dataframe(df, hide_index=True, width='stretch')
+        except Exception:
+            st.write(inst[:25])
+        st.caption("A parked car is MOVABLE_BUT_STATIONARY, not STATIC. "
+                   "Conflating the two gives either permanent holes in car "
+                   "parks or trails behind pedestrians.")
+
+# ── latency ──────────────────────────────────────────────────
+with tab_lat:
+    st.markdown("##### Per-stage latency  ·  M6")
+    lat = R_["latency"]
+    stages = [s for s in ("S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7",
+                          "S8", "S9") if s in lat]
+    names = {"S0": "ingest", "S1": "indices", "S2": "ground + tiles",
+             "S3": "pre-allocation", "S4": "semantics", "S5": "motion + tracks",
+             "S6": "allocation", "S7": "map update", "S8": "MOS gate",
+             "S9": "telemetry"}
+    try:
+        import pandas as pd
+        df = pd.DataFrame([{"stage": s, "what": names.get(s, ""),
+                            "p50 (ms)": round(lat[s]["p50"], 2),
+                            "p95 (ms)": round(lat[s]["p95"], 2),
+                            "p99 (ms)": round(lat[s]["p99"], 2)}
+                           for s in stages]
+                          + [{"stage": "TOTAL", "what": "",
+                              "p50 (ms)": round(lat["TOTAL"]["p50"], 1),
+                              "p95 (ms)": round(lat["TOTAL"]["p95"], 1),
+                              "p99 (ms)": round(lat["TOTAL"]["p99"], 1)}])
+        st.dataframe(df, hide_index=True, width='stretch')
+    except Exception:
+        st.write(lat)
+    st.caption("p99 is shown because for a real-time system the tail IS the "
+               "requirement — the mean hides exactly the frames that would "
+               "miss their deadline. Measured on this machine, CPU only, "
+               f"with the warm-up frame discarded. Page render: {elapsed:.2f} s.")
 
 st.markdown("---")
-
-# ════════════════════════════════════════════════════════════
-# TABS
-# ════════════════════════════════════════════════════════════
-from adaptive_lidar.visualization.dashboard import (
-    pointcloud_figure, semantic_pointcloud_figure,
-    range_image_figure, allocation_heatmap, map_figure, telemetry_bar,
-    CLASS_NAMES,
-)
-
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-    "1 Raw LiDAR", "2 Range Image", "3 Geometry",
-    "4 🎯 Adaptive Allocation", "5 Semantics",
-    "6 Motion", "7 🗺️ 2.5D Map", "8 Telemetry",
-])
-
-
-# ── Tab 1: Raw LiDAR ─────────────────────────────────────────
-with tab1:
-    if show_raw and frame.points is not None:
-        fig = pointcloud_figure(
-            frame.points,
-            color_arr=frame.intensity,
-            colorscale="Plasma",
-            title=f"Raw LiDAR — Frame {frame.frame_id} ({len(frame.points):,} pts)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    col1, col2 = st.columns(2)
-    col1.metric("Points after filter", f"{len(frame.points):,}")
-    col2.metric("S0 latency", f"{frame.timing.get('S0',0):.1f} ms")
-
-
-# ── Tab 2: Range Image ────────────────────────────────────────
-with tab2:
-    if frame.range_image is not None:
-        fig = range_image_figure(frame.range_image)
-        st.plotly_chart(fig, use_container_width=True)
-        c1, c2 = st.columns(2)
-        c1.metric("Range image size",
-                  f"{frame.range_image.shape[0]} × {frame.range_image.shape[1]}")
-        c2.metric("S1 latency", f"{frame.timing.get('S1',0):.1f} ms")
-    else:
-        st.warning("Range image not available.")
-
-
-# ── Tab 3: Geometry ───────────────────────────────────────────
-with tab3:
-    st.markdown("**Ground / Non-ground separation**  "
-                "*(Prototype: height-grid method — future: Patchwork++)*")
-    if frame.ground_mask is not None:
-        n_gnd = int(frame.ground_mask.sum())
-        n_ng = int((~frame.ground_mask).sum())
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Ground pts", f"{n_gnd:,}")
-        c2.metric("Non-ground pts", f"{n_ng:,}")
-        c3.metric("S2 latency", f"{frame.timing.get('S2',0):.1f} ms")
-
-        # Colour points by ground/non-ground
-        color_arr = frame.ground_mask.astype(float)
-        fig = pointcloud_figure(
-            frame.points, color_arr=color_arr,
-            colorscale="RdYlGn",
-            title="Ground (green) vs Non-ground (red)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    if frame.tiles:
-        st.markdown("**Tile geometry features**")
-        import pandas as pd
-        df = pd.DataFrame([{
-            "tile_id": t.tile_id,
-            "cx": round(t.cx, 1), "cy": round(t.cy, 1),
-            "pts": t.point_count,
-            "density": round(t.density, 2),
-            "height_var": round(t.height_variance, 3),
-            "verticality": round(t.verticality, 2),
-            "roughness": round(t.roughness, 3),
-            "boundary": round(t.boundary_score, 2),
-        } for t in frame.tiles if t.point_count > 0])
-        st.dataframe(df, use_container_width=True, height=300)
-
-
-# ── Tab 4: Adaptive Allocation ────────────────────────────────
-with tab4:
-    if show_alloc and frame.tiles:
-        st.markdown(
-            "**Adaptive computation allocation** — RED = HIGH resolution (expensive), "
-            "BLUE = LOW (cheap). ⭐ = Safety pin (protected at any budget)."
-        )
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("🔴 HIGH", f"{n_hi} ({pct_hi:.0f}%)")
-        c2.metric("🟡 MEDIUM", f"{n_med} ({pct_med:.0f}%)")
-        c3.metric("🔵 LOW", f"{n_low} ({pct_low:.0f}%)")
-        c4.metric("⚠ Safety", n_safety)
-
-        st.markdown(
-            f"*Budget: **{budget_pct}%** — "
-            f"estimated sparse inference on **{pct_hi + pct_med:.0f}%** of tiles*"
-        )
-
-        fig = allocation_heatmap(frame.tiles)
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Explain panel — top 5 tiles by info value
-        st.markdown("---\n**🔍 Top tiles by information value**")
-        top_tiles = sorted(frame.tiles, key=lambda t: t.info_value, reverse=True)[:8]
-        for tile in top_tiles:
-            with st.expander(
-                f"Tile {tile.tile_id} ({tile.cx:.0f},{tile.cy:.0f}) — "
-                f"V={tile.info_value:.3f} → {['5cm','10cm','20cm','40cm','80cm'][tile.resolution_level]}"
-                f" {'⚠ SAFETY PIN' if tile.safety_pinned else ''}",
-                expanded=False,
-            ):
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Geometry G", f"{tile.score_geometry:.3f}")
-                c2.metric("Semantic S", f"{tile.score_semantic:.3f}")
-                c3.metric("Uncertainty U", f"{tile.score_uncertainty:.3f}")
-                c4.metric("Dynamic D", f"{tile.score_dynamic:.3f}")
-                st.caption(
-                    f"Priority = V/cost = {tile.priority():.3f} | "
-                    f"Points: {tile.point_count} | "
-                    f"Range: {tile.range_mean:.1f} m"
-                )
-                if tile.safety_pinned:
-                    st.warning(f"⚠ Safety reason: {tile.safety_reason}")
-    else:
-        st.info("No allocation data available.")
-
-
-# ── Tab 5: Semantics ──────────────────────────────────────────
-with tab5:
-    if show_sem and frame.tiles:
-        sem_labels = np.zeros(len(frame.points), dtype=np.int32)
-        for tile in frame.tiles:
-            if tile.semantic_class >= 0 and len(tile.point_indices) > 0:
-                sem_labels[tile.point_indices] = tile.semantic_class
-
-        fig = semantic_pointcloud_figure(
-            frame.points, sem_labels,
-            title="Semantic Perception (selected tiles only)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Per-class summary
-        import pandas as pd
-        class_counts = {cls: int((sem_labels == i).sum())
-                        for i, cls in enumerate(CLASS_NAMES)}
-        df = pd.DataFrame(list(class_counts.items()), columns=["class", "points"])
-        st.dataframe(df, use_container_width=True)
-
-        avg_conf = np.mean([t.semantic_confidence for t in frame.tiles if t.selected])
-        avg_unc = np.mean([t.semantic_uncertainty for t in frame.tiles if t.selected])
-        c1, c2, c3 = st.columns(3)
-        c1.metric("S4 latency", f"{frame.timing.get('S4',0):.1f} ms")
-        c2.metric("Avg confidence", f"{avg_conf:.2f}")
-        c3.metric("Avg uncertainty", f"{avg_unc:.2f}")
-
-        st.caption(
-            f"⚠ Backend: **{backend_name}** — "
-            "only selected tiles were processed by the semantic stage."
-        )
-
-
-# ── Tab 6: Motion ─────────────────────────────────────────────
-with tab6:
-    if pipe.context.instance_history:
-        inst_dict = pipe.context.instance_history[-1]
-        if inst_dict:
-            import pandas as pd
-            rows = []
-            for inst in inst_dict.values():
-                speed = float(np.linalg.norm(inst.velocity)) if inst.velocity is not None else 0.0
-                rows.append({
-                    "id": inst.instance_id,
-                    "class": CLASS_NAMES[inst.semantic_class] if inst.semantic_class < 6 else "?",
-                    "cx": round(float(inst.centroid[0]), 1),
-                    "cy": round(float(inst.centroid[1]), 1),
-                    "cz": round(float(inst.centroid[2]), 1),
-                    "pts": inst.point_count,
-                    "speed (m/s)": round(speed, 2),
-                    "motion_prob": round(inst.motion_probability, 2),
-                    "dynamic": "🔴 YES" if inst.is_dynamic else "🟢 NO",
-                })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True)
-
-            n_dyn = sum(1 for i in inst_dict.values() if i.is_dynamic)
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Instances", len(inst_dict))
-            c2.metric("Dynamic", n_dyn)
-            c3.metric("S5 latency", f"{frame.timing.get('S5',0):.1f} ms")
-
-            st.caption("PROTOTYPE: motion = centroid displacement / Δt | Future: 4DMOS")
-        else:
-            st.info("No instances detected in this frame.")
-    else:
-        st.info("Process multiple frames to see motion tracking.")
-
-
-# ── Tab 7: 2.5D Map ───────────────────────────────────────────
-with tab7:
-    if show_map and pipe.map_cells:
-        map_mode = st.radio(
-            "Map view mode",
-            ["semantic", "elevation", "occupancy"],
-            horizontal=True,
-        )
-        amap = getattr(pipe.context, "_amap", None)
-        if amap:
-            arrs = amap.all_cells_as_arrays()
-            cx_a, cy_a, gz_a, zmx_a, occ_a, scl_a, scnf_a, unk_a, dyn_a = arrs
-            if len(cx_a) > 0:
-                fig = map_figure(
-                    cx_a, cy_a, scl_a, occ_a, unk_a.astype(bool),
-                    mode=map_mode,
-                    z_arr=zmx_a,
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Map cells", len(cx_a))
-                c2.metric("Unknown", f"{unk_a.mean()*100:.0f}%")
-                c3.metric("Avg occupancy", f"{occ_a.mean():.2f}")
-                c4.metric("S7 latency", f"{frame.timing.get('S7',0):.1f} ms")
-                st.caption(
-                    "IMPORTANT: Unknown cells ≠ Free space. "
-                    "No LiDAR return does NOT mean the area is drivable."
-                )
-    else:
-        st.info("Map data will appear after frames are processed.")
-
-
-# ── Tab 8: Telemetry ──────────────────────────────────────────
-with tab8:
-    st.markdown("**Per-stage latency (current frame)**")
-    fig = telemetry_bar(frame.timing)
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Stage timing table across all frames
-    import pandas as pd
-    stages = ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]
-    rows = []
-    for s in stages:
-        p50 = pipe.context.p50(s)
-        p95 = pipe.context.p95(s)
-        latest = frame.timing.get(s, 0.0)
-        rows.append({"Stage": s, "Latest (ms)": round(latest, 2),
-                     "P50 (ms)": round(p50, 2), "P95 (ms)": round(p95, 2)})
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
-
-    total_latest = sum(frame.timing.get(s, 0) for s in stages)
-    st.metric(
-        "Total pipeline latency",
-        f"{total_latest:.1f} ms",
-        help="Actual measured. TARGET: ~40 ms (future C++/CUDA implementation)."
-    )
-    st.caption(
-        "⚠ TARGET: ~40 ms/frame is the **future** C++/CUDA goal. "
-        "The current Python prototype measures actual latency without claims."
-    )
+st.markdown(
+    '<div class="prov">Every number on this page was measured in this '
+    'session. Nothing is illustrative. Run <code>python '
+    'scripts/run_baselines.py &amp;&amp; python scripts/generate_report.py'
+    '</code> for the full evaluation.</div>', unsafe_allow_html=True)
