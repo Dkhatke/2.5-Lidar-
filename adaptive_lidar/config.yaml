@@ -1,0 +1,84 @@
+# ============================================================
+# SIH26 — Adaptive Foveated 2.5D LiDAR Perception
+# Configuration — All constants live here, never scattered in code
+# ============================================================
+
+sensor:
+  max_range: 75.0          # metres
+  min_range: 0.3
+  vertical_fov: 30.0       # degrees total (±15)
+  horizontal_resolution: 0.2  # degrees
+  num_rings: 64
+  height: 1.8              # sensor mount height above ground (m)
+
+voxel:
+  query_size: 0.25         # S1 coarse query index voxel size (m)
+
+tiles:
+  size: 2.0                # tile edge length (m)
+  x_range: [-40, 40]       # metres around ego
+  y_range: [-40, 40]
+
+resolution:
+  levels:
+    LEVEL_0: 0.05          # finest — 5 cm
+    LEVEL_1: 0.10
+    LEVEL_2: 0.20
+    LEVEL_3: 0.40
+    LEVEL_4: 0.80          # coarsest — 80 cm
+  thresholds:
+    high: 0.65             # score >= high → LEVEL_0
+    medium: 0.35           # score >= medium → LEVEL_1/2 depending on range
+    low: 0.0               # otherwise → LEVEL_3/4
+
+budget:
+  default: 0.80            # fraction of compute budget (1.0 = full)
+  min_safety_budget: 0.05  # safety-pinned tiles always allocated
+
+weights:
+  geometry: 0.35
+  semantic: 0.20
+  uncertainty: 0.25
+  dynamic: 0.20
+
+thresholds:
+  motion:
+    displacement: 0.3      # metres per frame to classify as MOVING
+    probability: 0.55
+  obstacle:
+    height: 0.4            # min z above ground to be an obstacle
+    min_points: 5
+  uncertainty:
+    low_density_points: 10
+    semantic: 0.4          # uncertainty > this → raise priority
+  safety:
+    max_range_pin: 20.0    # tiles within this range with obstacle → pinned
+    pedestrian_height_max: 2.2
+    pedestrian_height_min: 0.8
+    pedestrian_footprint_max: 1.5
+  ground:
+    height_threshold: 0.3  # points within this of grid floor are ground
+    grid_resolution: 1.0
+
+map:
+  resolution: 0.10         # default map cell size (m)
+  temporal_decay: 0.85     # weight of previous observation
+  unknown_flag: true
+  log_odds_free: -0.3
+  log_odds_occupied: 0.5
+  log_odds_min: -2.0
+  log_odds_max: 2.0
+
+semantics:
+  classes:
+    - ground_drivable
+    - ground_rough
+    - static_obstacle
+    - vehicle
+    - vru
+    - vegetation
+  num_classes: 6
+
+pipeline:
+  target_latency_ms: 40.0  # conceptual future target — NOT a claim
+  max_frames_history: 5

@@ -1,0 +1,47 @@
+# ============================================================
+# SIH26 — Adaptive Foveated 2.5D LiDAR Perception
+# requirements.txt
+#
+# HOW TO INSTALL (first time)
+# ----------------------------
+#   python3 -m venv .venv
+#   source .venv/bin/activate          # Windows: .venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# HOW TO RUN
+# ----------
+#   streamlit run app.py               # visual dashboard
+#   python main.py --demo              # CLI demo (synthetic scene)
+#   python main.py --synthetic         # explicit synthetic mode
+#   python -m pytest tests/            # run all unit tests
+#
+# OPTIONAL BACKENDS (install separately — do NOT block if missing)
+# ----------------------------------------------------------------
+#   MinkowskiEngine  →  see docs/INSTALL_MINKOWSKI.md
+#   open3d           →  pip install open3d  (for 3-D point-cloud viewer)
+# ============================================================
+
+
+# ── Core numerics ──────────────────────────────────────────
+numpy>=1.24,<3.0          # Array math backbone — used everywhere
+scipy>=1.10               # KD-tree, connected components, signal processing
+pandas>=2.0               # Telemetry tables, timing stats, CSV export
+
+# ── Machine learning ───────────────────────────────────────
+torch>=2.0                # PyTorch — PrototypeSparseBackend lives here
+                          # CPU-only is fine; CUDA picked up automatically
+scikit-learn>=1.2         # Connected components, nearest-neighbour for S5
+
+# ── Visualisation & Dashboard ──────────────────────────────
+streamlit>=1.28           # Main dashboard (app.py)
+plotly>=5.14              # All interactive plots inside Streamlit
+
+# ── Config & utilities ─────────────────────────────────────
+pyyaml>=6.0               # Reads config.yaml — all constants live there
+
+# ── Optional (install for richer 3-D visualisation) ────────
+# open3d>=0.17            # Uncomment if you want the Open3D 3-D viewer tab
+#                         # May be slow to install on some platforms
+
+# ── Development / testing ──────────────────────────────────
+pytest>=7.0               # Unit tests (tests/ directory)

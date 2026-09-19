@@ -1,0 +1,72 @@
+# ── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Distribution / packaging ────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ── Testing & coverage ──────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Jupyter ─────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDEs ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Dataset files (large — do NOT commit to git) ────────────
+# SemanticKITTI velodyne scans + labels
+dataset/
+data/sequences/
+*.bin
+*.label
+
+# NumPy binary arrays (large point clouds)
+*.npy
+*.npz
+
+# PLY / PCD point clouds
+*.ply
+*.pcd
+
+# ── Model checkpoints (large) ───────────────────────────────
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+weights/
+
+# ── Logs & outputs ──────────────────────────────────────────
+logs/
+outputs/
+runs/
+*.log
+
+# ── Streamlit cache ─────────────────────────────────────────
+.streamlit/
+
+# ── OS ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
