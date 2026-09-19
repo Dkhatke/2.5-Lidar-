@@ -17,7 +17,7 @@ pip install -r adaptive_lidar/requirements.txt
 
 cd adaptive_lidar
 python main.py --demo                 # the pipeline, end to end
-streamlit run app.py                  # the dashboard
+streamlit run app.py                  # the dashboard (see the ★ Drive tab)
 ```
 
 No data download, no configuration, no GPU. The synthetic sensor model and the
@@ -99,6 +99,13 @@ Selected measured outcomes:
   uniform 80 cm grid 162×.
 * **The MOS gate removes the trail.** 12.00 m of phantom wall with the gate
   off, 0.00 m with it on, on the same 20-frame run.
+* **Motion is judged in the world, not relative to the sensor.** In the
+  `convoy` scenario a car travelling at exactly the ego speed (0.30 m/s
+  relative) is correctly MOVING, and a genuinely parked one is
+  MOVABLE_BUT_STATIONARY — the reading a naive frame-difference would get
+  backwards in both cases.
+* **Driving 19 m does not smear the map.** A building facade accumulated over
+  a whole run is still one cell thick.
 * **The map aggregates exactly.** Coarsening a level-0 map to level 2 matches
   a natively-built level-2 map: `n_points` bit-identical, `z_max` bit-identical
   in 99.98% of cells and the rest within the float16 quantum (~4 mm).

@@ -89,10 +89,22 @@ st.markdown(CSS, unsafe_allow_html=True)
 # ════════════════════════════════════════════════════════════
 # Pipeline execution, cached per configuration
 # ════════════════════════════════════════════════════════════
+#: Generate the longest run anyone asks for and slice it, so the main
+#: dashboard at 6 frames and the Drive tab at 12 share one generation instead
+#: of paying for the scans twice.
+_MAX_FRAMES = 24
+
+
 @st.cache_resource(show_spinner=False)
-def load_frames(scenario: str, n_frames: int):
-    ds = get_dataset("synthetic", None, n_frames, scenario=scenario, quiet=True)
+def _load_all_frames(scenario: str):
+    ds = get_dataset("synthetic", None, _MAX_FRAMES, scenario=scenario,
+                     quiet=True)
     return list(ds), ds.name
+
+
+def load_frames(scenario: str, n_frames: int):
+    frames, name = _load_all_frames(scenario)
+    return frames[:n_frames], name
 
 
 @st.cache_resource(show_spinner=False)
@@ -166,6 +178,19 @@ def run_pipeline(scenario, n_frames, policy, budget, backend,
         "pose": last.pose,
         "n_points": len(last.points),
     }
+
+
+@st.cache_resource(show_spinner=False, max_entries=12)
+def precompute_drive(scenario: str, n_frames: int, gate: bool):
+    """Run the pipeline ONCE over a scenario and cache every frame.
+
+    Cached on (scenario, frames, gate) so the MOS A/B toggle is instant and
+    camera work never touches the pipeline.
+    """
+    from adaptive_lidar.visualization.playback import precompute
+    frames, _ = load_frames(scenario, n_frames)
+    return precompute(load_config(), frames, scenario, "full", 0.5,
+                      "auto", gate)
 
 
 def trav_for(amap, profile_name):
@@ -385,8 +410,14 @@ st.caption("Signed bias is shown next to RMSE because a planner can absorb "
 # ════════════════════════════════════════════════════════════
 # Tabs
 # ════════════════════════════════════════════════════════════
-tab_cmp, tab_cell, tab_obj, tab_lat = st.tabs(
-    ["★ Equal-memory comparison", "Cell inspector", "Objects", "Latency"])
+tab_drive, tab_cmp, tab_cell, tab_obj, tab_lat = st.tabs(
+    ["★ Drive", "★ Equal-memory comparison", "Cell inspector", "Objects",
+     "Latency"])
+
+# ── ego motion, cameras, playback ────────────────────────────
+with tab_drive:
+    from adaptive_lidar.visualization.drive_tab import render_drive_tab
+    render_drive_tab(precompute_drive)
 
 # ── the money shot ───────────────────────────────────────────
 with tab_cmp:

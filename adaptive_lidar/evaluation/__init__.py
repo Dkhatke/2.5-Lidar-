@@ -12,9 +12,12 @@ from adaptive_lidar.evaluation.metrics import (  # noqa: F401
     elevation_error,
     latency_percentiles,
     map_completeness,
+    moving_object_path,
     measure_memory,
     object_retention_rate,
     range_stratified_iou,
+    trail_profile,
+    vehicle_half_length,
 )
 from adaptive_lidar.evaluation.reference_map import (  # noqa: F401
     ReferenceMap,

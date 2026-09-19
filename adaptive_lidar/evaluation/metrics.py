@@ -306,6 +306,131 @@ def boundary_consistency(amap) -> Dict[str, Any]:
 
 
 # ════════════════════════════════════════════════════════════
+# Trail length — the MOS gate ablation
+# ════════════════════════════════════════════════════════════
+#: A trail is a phantom WALL, so a bin counts as trailing only if it holds at
+#: least this many spurious cells. One isolated cell 8 m back is a speck, not a
+#: wall, and a metric that lets a single straggler define the answer measures
+#: the worst outlier rather than the artefact.
+BIN_M = 0.5
+MIN_CELLS_PER_BIN = 3
+
+
+def moving_object_path(loader_frames) -> List[Optional[np.ndarray]]:
+    out = []
+    for f in loader_frames:
+        m = np.asarray(f.get("gt_moving")) if f.get("gt_moving") is not None else None
+        if m is None or not m.any():
+            out.append(None)
+            continue
+        pose = f.get("pose")
+        pose = np.eye(4) if pose is None else np.asarray(pose)
+        pw = np.asarray(f["points"])[:, :3] @ pose[:3, :3].T + pose[:3, 3]
+        out.append(pw[m][:, :2].mean(axis=0))
+    return out
+
+
+def vehicle_half_length(frames) -> float:
+    """Half the largest moving OBJECT's extent, not of all movers together.
+
+    Taking the bounding box of every moving point at once is wrong the moment
+    a scene has two of them: in `convoy` an oncoming car and one travelling
+    alongside are fifty metres apart, and their combined box reported a 26 m
+    "half length". Grouping by ground-truth instance first keeps it a property
+    of an object.
+    """
+    best = 0.0
+    for f in frames:
+        m = f.get("gt_moving")
+        if m is None:
+            continue
+        m = np.asarray(m)
+        if m.sum() < 20:
+            continue
+        pts = np.asarray(f["points"])[m][:, :2]
+        inst = f.get("gt_instance")
+        if inst is None:
+            best = max(best, float(np.ptp(pts, axis=0).max()))
+            continue
+        ids = np.asarray(inst)[m]
+        for oid in np.unique(ids):
+            sel = ids == oid
+            if sel.sum() < 20:
+                continue
+            best = max(best, float(np.ptp(pts[sel], axis=0).max()))
+    return max(best / 2.0, 1.0)
+
+
+def trail_profile(amap, truth_path, current_xy, corridor=2.5, rear_m=2.2):
+    """Spurious-obstacle profile behind the vehicle's true position.
+
+    Returns (trail_m, n_cells, max_behind_m, bins) where
+
+      trail_m      how far back the CONTIGUOUS phantom extends, in metres:
+                   walking backwards from the vehicle in 0.5 m bins, the
+                   distance at which the first bin holding fewer than
+                   MIN_CELLS_PER_BIN spurious cells is reached.
+      n_cells      every spurious cell behind the vehicle, contiguous or not.
+      max_behind_m the furthest single spurious cell — reported alongside so
+                   the contiguity rule cannot hide a long tail.
+
+    A cell is spurious if the map still ASSERTS something standing above the
+    ground there. Cells the map has already retracted by free-space carving
+    are not phantoms; they are the system correcting itself.
+    """
+    from adaptive_lidar.pipeline.types import Occupancy
+
+    a = amap.all_cells_arrays()
+    if len(a["cx"]) == 0 or current_xy is None:
+        return 0.0, 0, 0.0, []
+
+    obst = (((a["z_max"] - a["ground_z"]) > 0.35)
+            & (a["occupancy_state"] != Occupancy.FREE))
+    if not obst.any():
+        return 0.0, 0, 0.0, []
+
+    pts = np.array([p for p in truth_path if p is not None])
+    if len(pts) < 2:
+        return 0.0, 0, 0.0, []
+
+    cx, cy = a["cx"][obst], a["cy"][obst]
+    d = np.min(np.hypot(cx[:, None] - pts[None, :, 0],
+                        cy[:, None] - pts[None, :, 1]), axis=1)
+    on_path = d <= corridor
+
+    travel = pts[-1] - pts[0]
+    L = float(np.linalg.norm(travel))
+    if L < 1e-6:
+        return 0.0, 0, 0.0, []
+    u = travel / L
+    s_cell = (cx[on_path] - pts[0][0]) * u[0] + (cy[on_path] - pts[0][1]) * u[1]
+    s_now = (current_xy[0] - pts[0][0]) * u[0] + (current_xy[1] - pts[0][1]) * u[1]
+
+    # "Behind the vehicle" means behind its REAR EXTENT, not behind its
+    # centroid. The exclusion is therefore half the vehicle's true length,
+    # measured from the ground truth rather than assumed: with a hardcoded
+    # 1.5 m against a 4.4 m car, the car's own rear half was being counted as
+    # its trail.
+    behind_m = s_now - s_cell
+    keep = behind_m > rear_m
+    behind_m = behind_m[keep]
+    if behind_m.size == 0:
+        return 0.0, 0, 0.0, []
+
+    n_bins = int(np.ceil(behind_m.max() / BIN_M)) + 1
+    counts = np.bincount((behind_m / BIN_M).astype(np.int64), minlength=n_bins)
+
+    # The trail is the EXTENT of the phantom: from the nearest qualifying bin
+    # to the furthest one. Requiring the run to start immediately behind the
+    # vehicle would report zero whenever there is a gap between the car and the
+    # wall it left, which is exactly the case where the phantom is worst.
+    lo = int(rear_m / BIN_M)
+    qual = np.flatnonzero(counts[lo:] >= MIN_CELLS_PER_BIN)
+    trail = 0.0 if qual.size == 0 else float((qual.max() - qual.min() + 1) * BIN_M)
+    return trail, int(behind_m.size), float(behind_m.max()), counts.tolist()
+
+
+# ════════════════════════════════════════════════════════════
 # Memory and latency
 # ════════════════════════════════════════════════════════════
 def measure_memory(build_fn) -> Tuple[Any, int]:

@@ -40,13 +40,21 @@ class _Track:
     """Constant-velocity Kalman filter on a 6-state [x y z vx vy vz]."""
 
     __slots__ = ("id", "x", "P", "cls", "age", "n_obs", "misses",
-                 "bbox_min", "bbox_max", "state", "last_t")
+                 "bbox_min", "bbox_max", "state", "last_t",
+                 "origin", "path_len", "_prev_pos")
 
     def __init__(self, tid: int, inst: Instance, t: float,
-                 pos_var: float, vel_var: float):
+                 pos_var: float, vel_var: float,
+                 world_pos: np.ndarray = None):
         self.id = tid
         self.x = np.zeros(6, dtype=np.float64)
-        self.x[:3] = inst.centroid
+        # WORLD position, not the sensor-frame centroid the detection carries.
+        # Seeding origin from the sensor frame and then overwriting the state
+        # with world coordinates made every stationary track accrue the EGO's
+        # own displacement, so a parked car read as travelling 12 m.
+        p0 = (np.asarray(inst.centroid, dtype=np.float64) if world_pos is None
+              else np.asarray(world_pos, dtype=np.float64))
+        self.x[:3] = p0
         self.P = np.diag([pos_var, pos_var, pos_var,
                           vel_var, vel_var, vel_var]).astype(np.float64)
         self.cls = inst.semantic_class
@@ -57,6 +65,11 @@ class _Track:
         self.bbox_max = inst.bbox_max.copy()
         self.state = TrackState.STATIC
         self.last_t = t
+        # Where this track was first seen, and how far it has actually
+        # travelled since — see _state_of for why both are needed.
+        self.origin = p0.copy()
+        self.path_len = 0.0
+        self._prev_pos = p0.copy()
 
     def predict(self, dt: float, q_pos: float, q_vel: float):
         F = np.eye(6)
@@ -77,6 +90,8 @@ class _Track:
         self.P = (np.eye(6) - K @ H) @ self.P
         self.n_obs += 1
         self.misses = 0
+        self.path_len += float(np.linalg.norm(self.x[:3] - self._prev_pos))
+        self._prev_pos = self.x[:3].copy()
 
     @property
     def pos(self) -> np.ndarray:
@@ -90,6 +105,38 @@ class _Track:
     def speed(self) -> float:
         return float(np.linalg.norm(self.x[3:]))
 
+    @property
+    def displacement(self) -> float:
+        """How far the track has actually got from where it started."""
+        return float(np.linalg.norm(self.x[:3] - self.origin))
+
+    @property
+    def diag(self) -> float:
+        """The object's own footprint diagonal — the scale its apparent
+        centroid can drift over without the object having moved at all."""
+        return float(np.linalg.norm((self.bbox_max - self.bbox_min)[:2]))
+
+    @property
+    def straightness(self) -> float:
+        """Net displacement over path length: 1 = went somewhere, 0 = wandered.
+
+        THE DISCRIMINATOR FOR A PARKED CAR SEEN FROM A MOVING VEHICLE.
+        As the ego approaches a stationary object, the set of surfaces the
+        beams can reach changes — you see less of its rear and more of its
+        side — so the centroid of the observed points drifts by a metre or
+        two even though nothing moved. Instantaneous speed cannot tell that
+        apart from real motion: in the `convoy` scenario the parked car and
+        the car travelling at the ego speed BOTH show ~1 m of centroid
+        movement per frame.
+
+        What separates them is coherence. Real motion accumulates in one
+        direction, so net displacement tracks path length. Visibility drift
+        wanders inside the object's own footprint and cancels: measured on
+        `convoy`, the two genuinely moving vehicles score 1.00 and the parked
+        one scores 0.10 over 15.6 m of wandered path.
+        """
+        return self.displacement / max(self.path_len, 1e-6)
+
 
 class Tracker:
     def __init__(self, config: Dict[str, Any]):
@@ -99,6 +146,12 @@ class Tracker:
         self.max_misses = int(t.get("max_misses", 3))
         self.min_speed = float(t.get("min_speed", 0.6))       # m/s to call MOVING
         self.confirm_obs = int(t.get("confirm_observations", 2))
+        # Net displacement / path length required to call a track MOVING, and
+        # the absolute distance it must have covered. Both guard against
+        # visibility-induced centroid drift on stationary objects.
+        self.min_straightness = float(t.get("min_straightness", 0.5))
+        self.min_displacement = float(t.get("min_displacement", 1.5))
+        self.extent_factor = float(t.get("displacement_extent_factor", 1.0))
         self.q_pos = float(t.get("process_noise_pos", 0.05))
         self.q_vel = float(t.get("process_noise_vel", 2.0))
         self.r_meas = float(t.get("measurement_noise", 0.15))
@@ -142,8 +195,8 @@ class Tracker:
             tid = self._next_id
             self._next_id += 1
             self._tracks[tid] = _Track(tid, det, timestamp,
-                                       pos_var=0.5, vel_var=4.0)
-            self._tracks[tid].x[:3] = world_cent[di]
+                                       pos_var=0.5, vel_var=4.0,
+                                       world_pos=world_cent[di])
             assigned[di] = tid
             seen.add(tid)
 
@@ -209,11 +262,25 @@ class Tracker:
         if trk.n_obs < self.confirm_obs:
             # Not yet confirmed: assume the cautious reading for movable things.
             return TrackState.MOVABLE_BUT_STATIONARY if movable else TrackState.STATIC
-        if movable and trk.speed > self.min_speed:
+        if not movable:
+            return TrackState.STATIC
+
+        # MOVING requires speed AND coherence. Speed alone calls a parked car
+        # moving, because its apparent centroid drifts as the ego drives past
+        # and the visible surfaces change. See _Track.straightness.
+        # The gate scales with the object's OWN SIZE. Visibility drift is
+        # bounded by the footprint - as the ego drives past a 4.6 m car the
+        # observed centroid slides along it and no further - so "has it moved
+        # further than its own length?" is the question that separates a
+        # parked car from a moving one. Measured on `convoy`: the parked car
+        # drifts 4.1 m against a 5.0 m diagonal, the two moving vehicles
+        # cover 19-20 m against diagonals of 4.8 and 2.3.
+        gate = max(self.min_displacement, self.extent_factor * trk.diag)
+        going_somewhere = (trk.straightness >= self.min_straightness
+                           and trk.displacement >= gate)
+        if trk.speed > self.min_speed and going_somewhere:
             return TrackState.MOVING
-        if movable:
-            return TrackState.MOVABLE_BUT_STATIONARY
-        return TrackState.STATIC
+        return TrackState.MOVABLE_BUT_STATIONARY
 
 
 def _greedy(cost: np.ndarray):  # pragma: no cover

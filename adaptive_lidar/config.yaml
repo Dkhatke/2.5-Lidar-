@@ -105,6 +105,13 @@ tracking:
   max_misses: 3
   min_speed: 0.6           # m/s above which a movable track is MOVING
   confirm_observations: 2
+  # A parked car seen from a moving vehicle shows ~1 m/frame of apparent
+  # centroid motion as its visible surfaces change, which is the same as a car
+  # travelling at the ego speed. Requiring the motion to be COHERENT - net
+  # displacement over path length - separates them: 1.00 vs 0.10 on `convoy`.
+  min_straightness: 0.5    # net displacement / path length
+  min_displacement: 1.5    # metres actually covered, absolute floor
+  displacement_extent_factor: 1.0   # ... and at least this x its own diagonal
   process_noise_pos: 0.05
   process_noise_vel: 2.0
   measurement_noise: 0.15

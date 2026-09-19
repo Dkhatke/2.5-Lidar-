@@ -244,11 +244,45 @@ adaptive_lidar/
     loader.py              auto-detecting dataset interface
     label_maps.py          collision-proof label tables
 
-  visualization/render.py  map → image
+  visualization/
+    render.py              map -> image, including a rotated camera
+    camera.py              frames of reference and the five presets
+    overlays.py            ego, object boxes by state, corridor, age tint
+    playback.py            pre-compute + cache, swept corridor, wall probe
+    drive_tab.py           the Drive tab
   scripts/                 profiling, training, the four verifications,
                            baselines, report generation
   tests/                   63 tests, including the gt-isolation guard
 ```
+
+---
+
+## Ego motion and the frame of reference
+
+The map is **world-anchored in both view frames**. The frame selector in the
+Drive tab is a transform on the way to pixels and nothing else; there is no
+ego-frame storage mode, because storing in the ego frame is precisely what
+makes static geometry smear.
+
+World is the default view. In the vehicle frame the entire static scene
+slides past, which reads as "everything is moving" — the opposite of the
+point — so the vehicle frame is reserved for the moment that illusion is the
+subject, which is the `convoy` scenario.
+
+Three things are accumulated outside the map because the map cannot answer
+them:
+
+* the **swept corridor**, because the sliding window has already evicted the
+  cells behind the vehicle;
+* **wall thickness**, a correctness check — a facade accumulated over a whole
+  run should still be one cell thick, and would not be if the pose transform
+  were wrong;
+* **trail length**, which needs ground truth and therefore lives in
+  `evaluation/`.
+
+The pipeline runs once per frame when a scenario loads. Camera movement,
+layer changes and scrubbing all read the cache, which is why the replay rate
+on screen is labelled a replay rate and never as FPS.
 
 ---
 

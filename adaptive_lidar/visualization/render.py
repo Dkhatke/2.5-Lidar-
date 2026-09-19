@@ -292,3 +292,108 @@ def legend_html(layer: str) -> str:
                 "grey 0 &rarr; red 1</span>")
     return ("<span style='font-size:12px'>corrected intensity "
             "(reflectance): dark 0 &rarr; yellow 0.8</span>")
+
+
+# ════════════════════════════════════════════════════════════
+# Playback rendering: a frame of reference and a rotated camera
+# ════════════════════════════════════════════════════════════
+def render_view(
+    cells: Dict[str, np.ndarray],
+    view,
+    layer: str = "semantic",
+    *,
+    frame_of_reference: str = "World",
+    ego_xy=(0.0, 0.0),
+    heading: float = 0.0,
+    show_cell_edges: bool = False,
+    trav: Optional[np.ndarray] = None,
+    age_tint_frame: Optional[int] = None,
+    age_window: int = 3,
+    background=(250, 250, 252),
+) -> np.ndarray:
+    """Paint a cached frame's cells through a camera.
+
+    Same rules as :func:`render` — cells are filled rectangles at their TRUE
+    size, painted coarse-first so fine cells overwrite them — with two
+    additions the playback needs: the view may be rotated (the chase camera),
+    and the whole scene may be expressed in the vehicle's frame.
+
+    Neither changes what is stored. The map is world-anchored in both frames;
+    this is a transform on the way to pixels.
+    """
+    from adaptive_lidar.visualization.camera import to_frame
+    from adaptive_lidar.visualization.overlays import apply_age_tint
+
+    x0, x1, y0, y1 = view.extent
+    ppm = view.px_per_m
+    W = max(int((x1 - x0) * ppm), 16)
+    H = max(int((y1 - y0) * ppm), 16)
+    img = np.empty((H, W, 3), np.uint8)
+    img[:, :] = background
+    if cells is None or len(cells.get("cx", ())) == 0:
+        return img
+
+    from adaptive_lidar.visualization.playback import decode_cells
+    a = decode_cells(cells)
+    colours = cell_colours(a, layer, trav)
+    if age_tint_frame is not None and "last_seen" in a:
+        colours = apply_age_tint(colours, a["last_seen"], age_tint_frame,
+                                 age_window)
+
+    xy = np.stack([a["cx"], a["cy"]], axis=1).astype(np.float32)
+    xy = to_frame(xy, frame_of_reference, ego_xy, heading)
+    rot = view.rotation
+    if abs(rot) > 1e-6:
+        c, sn = np.cos(rot), np.sin(rot)
+        d = xy - np.array(view.centre, np.float32)
+        xy = np.stack([d[:, 0] * c - d[:, 1] * sn,
+                       d[:, 0] * sn + d[:, 1] * c], axis=1) \
+            + np.array(view.centre, np.float32)
+
+    lvl = a["level"]
+    # Coarse to fine, so a refinement is never hidden by its own parent.
+    for L in range(ResolutionLevel.N_LEVELS - 1, -1, -1):
+        m = lvl == L
+        if not m.any():
+            continue
+        s_m = float(ResolutionLevel.size(L))
+        sp = max(int(round(s_m * ppm)), 1)
+        px = ((xy[m, 0] - s_m / 2 - x0) * ppm).astype(np.int32)
+        py = ((xy[m, 1] - s_m / 2 - y0) * ppm).astype(np.int32)
+        c = colours[m]
+        keep = (px > -sp) & (px < W) & (py > -sp) & (py < H)
+        px, py, c = px[keep], py[keep], c[keep]
+        if px.size == 0:
+            continue
+        if sp == 1:
+            img[np.clip(py, 0, H - 1), np.clip(px, 0, W - 1)] = c
+            continue
+        for dy in range(sp):
+            gy = py + dy
+            ok = (gy >= 0) & (gy < H)
+            if not ok.any():
+                continue
+            for dx in range(sp):
+                gx = px + dx
+                o = ok & (gx >= 0) & (gx < W)
+                if o.any():
+                    img[gy[o], gx[o]] = c[o]
+        if show_cell_edges and sp >= 3:
+            edge = (np.asarray(c, np.int16) * 0.55).astype(np.uint8)
+            for dy in (0, sp - 1):
+                gy = py + dy
+                o = (gy >= 0) & (gy < H)
+                for dx in range(sp):
+                    gx = px + dx
+                    oo = o & (gx >= 0) & (gx < W)
+                    if oo.any():
+                        img[gy[oo], gx[oo]] = edge[oo]
+            for dx in (0, sp - 1):
+                gx = px + dx
+                o = (gx >= 0) & (gx < W)
+                for dy in range(sp):
+                    gy = py + dy
+                    oo = o & (gy >= 0) & (gy < H)
+                    if oo.any():
+                        img[gy[oo], gx[oo]] = edge[oo]
+    return img

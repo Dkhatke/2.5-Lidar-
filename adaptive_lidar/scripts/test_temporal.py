@@ -26,6 +26,12 @@ for p in (os.path.dirname(_PKG), _PKG):
         sys.path.insert(0, p)
 
 from adaptive_lidar.data.loader import get_dataset            # noqa: E402
+from adaptive_lidar.evaluation.metrics import (                # noqa: E402
+    BIN_M,
+    MIN_CELLS_PER_BIN,
+    trail_profile,
+    vehicle_half_length,
+)
 from adaptive_lidar.pipeline.pipeline import Pipeline         # noqa: E402
 from adaptive_lidar.pipeline.types import TrackState          # noqa: E402
 from adaptive_lidar.utils.config import load_config           # noqa: E402
@@ -61,95 +67,6 @@ def vehicle_truth(frames):
         pw = np.asarray(f["points"])[:, :3] @ pose[:3, :3].T + pose[:3, 3]
         out.append(pw[m][:, :2].mean(axis=0))
     return out
-
-
-#: A trail is a phantom WALL, so a bin counts as trailing only if it holds at
-#: least this many spurious cells. One isolated cell 8 m back is a speck, not a
-#: wall, and a metric that lets a single straggler define the answer measures
-#: the worst outlier rather than the artefact.
-BIN_M = 0.5
-MIN_CELLS_PER_BIN = 3
-
-
-def vehicle_half_length(frames) -> float:
-    """Half the moving vehicle's true extent along its direction of travel."""
-    best = 0.0
-    for f in frames:
-        m = np.asarray(f["gt_moving"])
-        if m.sum() < 20:
-            continue
-        p = np.asarray(f["points"])[m][:, :2]
-        best = max(best, float(np.ptp(p, axis=0).max()))
-    return max(best / 2.0, 1.0)
-
-
-def trail_profile(amap, truth_path, current_xy, corridor=2.5, rear_m=2.2):
-    """Spurious-obstacle profile behind the vehicle's true position.
-
-    Returns (trail_m, n_cells, max_behind_m, bins) where
-
-      trail_m      how far back the CONTIGUOUS phantom extends, in metres:
-                   walking backwards from the vehicle in 0.5 m bins, the
-                   distance at which the first bin holding fewer than
-                   MIN_CELLS_PER_BIN spurious cells is reached.
-      n_cells      every spurious cell behind the vehicle, contiguous or not.
-      max_behind_m the furthest single spurious cell — reported alongside so
-                   the contiguity rule cannot hide a long tail.
-
-    A cell is spurious if the map still ASSERTS something standing above the
-    ground there. Cells the map has already retracted by free-space carving
-    are not phantoms; they are the system correcting itself.
-    """
-    from adaptive_lidar.pipeline.types import Occupancy
-
-    a = amap.all_cells_arrays()
-    if len(a["cx"]) == 0 or current_xy is None:
-        return 0.0, 0, 0.0, []
-
-    obst = (((a["z_max"] - a["ground_z"]) > 0.35)
-            & (a["occupancy_state"] != Occupancy.FREE))
-    if not obst.any():
-        return 0.0, 0, 0.0, []
-
-    pts = np.array([p for p in truth_path if p is not None])
-    if len(pts) < 2:
-        return 0.0, 0, 0.0, []
-
-    cx, cy = a["cx"][obst], a["cy"][obst]
-    d = np.min(np.hypot(cx[:, None] - pts[None, :, 0],
-                        cy[:, None] - pts[None, :, 1]), axis=1)
-    on_path = d <= corridor
-
-    travel = pts[-1] - pts[0]
-    L = float(np.linalg.norm(travel))
-    if L < 1e-6:
-        return 0.0, 0, 0.0, []
-    u = travel / L
-    s_cell = (cx[on_path] - pts[0][0]) * u[0] + (cy[on_path] - pts[0][1]) * u[1]
-    s_now = (current_xy[0] - pts[0][0]) * u[0] + (current_xy[1] - pts[0][1]) * u[1]
-
-    # "Behind the vehicle" means behind its REAR EXTENT, not behind its
-    # centroid. The exclusion is therefore half the vehicle's true length,
-    # measured from the ground truth rather than assumed: with a hardcoded
-    # 1.5 m against a 4.4 m car, the car's own rear half was being counted as
-    # its trail.
-    behind_m = s_now - s_cell
-    keep = behind_m > rear_m
-    behind_m = behind_m[keep]
-    if behind_m.size == 0:
-        return 0.0, 0, 0.0, []
-
-    n_bins = int(np.ceil(behind_m.max() / BIN_M)) + 1
-    counts = np.bincount((behind_m / BIN_M).astype(np.int64), minlength=n_bins)
-
-    # The trail is the EXTENT of the phantom: from the nearest qualifying bin
-    # to the furthest one. Requiring the run to start immediately behind the
-    # vehicle would report zero whenever there is a gap between the car and the
-    # wall it left, which is exactly the case where the phantom is worst.
-    lo = int(rear_m / BIN_M)
-    qual = np.flatnonzero(counts[lo:] >= MIN_CELLS_PER_BIN)
-    trail = 0.0 if qual.size == 0 else float((qual.max() - qual.min() + 1) * BIN_M)
-    return trail, int(behind_m.size), float(behind_m.max()), counts.tolist()
 
 
 def run(gate_enabled, cfg, frames):

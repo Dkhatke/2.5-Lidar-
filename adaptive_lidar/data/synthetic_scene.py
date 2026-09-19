@@ -31,6 +31,7 @@ Deterministic given a seed: same seed, identical scene, byte for byte.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -474,7 +475,18 @@ def simulate_scan(
 # Scenarios
 # ════════════════════════════════════════════════════════════
 SCENARIOS = ("empty_road", "pedestrian_far", "canopy_over_road",
-             "moving_vehicle", "mixed_urban")
+             "moving_vehicle", "convoy", "mixed_urban")
+
+#: `convoy` object anchors, so the dashboard and the tests can name the
+#: three vehicles without re-deriving where they are.
+CONVOY_EGO_SPEED = 10.0
+# Placed so that a 20-frame run at 10 m/s actually RESOLVES all three: an
+# object the sensor barely sees cannot demonstrate anything about how it is
+# classified.
+CONVOY_A_X0, CONVOY_A_Y = 13.0, 5.2      # alongside, SAME speed as ego
+CONVOY_B_X0, CONVOY_B_Y = 62.0, -5.2     # oncoming, passes the ego mid-run
+CONVOY_C_X, CONVOY_C_Y = 26.0, 8.6       # genuinely parked, driven past
+CONVOY_PED_X, CONVOY_PED_Y = 34.0, 9.4   # static, on the pavement
 
 #: The demo's centrepiece — a pedestrian at exactly this range, which is where
 #: a uniform coarse grid loses them and the adaptive map must not.
@@ -504,6 +516,42 @@ def build_scene(name: str = "mixed_urban", t: float = 0.0, seed: int = 42) -> Sc
     if name == "moving_vehicle":
         # Crosses the road over ~20 frames at 10 Hz.
         s.vehicle(18.0, -14.0 + 8.0 * t, moving=True, velocity=(0.0, 8.0, 0.0))
+        return s
+
+    if name == "convoy":
+        # THE RELATIVE-MOTION SCENARIO.
+        #
+        # In the VEHICLE frame this scene lies to you twice: vehicle A, which
+        # is travelling at exactly the ego speed, appears parked; vehicle C,
+        # which is genuinely parked, appears to slide backwards. A pipeline
+        # that segmented motion by differencing consecutive sensor-frame scans
+        # would believe both illusions.
+        #
+        # This one transforms to WORLD coordinates before mapping and before
+        # tracking, so A comes out MOVING and C comes out
+        # MOVABLE_BUT_STATIONARY. That distinction is the whole reason the
+        # tracker carries three states instead of a boolean, and this scenario
+        # is the cheapest way to show it is real.
+        for x in range(-10, 110, 26):
+            s.box(x + 10.0, 13.0, 4.0, 24.0, 6.0, 8.0, STATIC_OBSTACLE, "brick")
+        for x in (6.0, 26.0, 50.0, 74.0, 96.0):
+            s.pole(x, 11.0, 0.10, 4.2)
+
+        # A — adjacent lane, SAME velocity as the ego. Near-zero relative
+        #     motion; looks parked from the vehicle, is moving in the world.
+        s.vehicle(CONVOY_A_X0 + CONVOY_EGO_SPEED * t, CONVOY_A_Y,
+                  moving=True, velocity=(CONVOY_EGO_SPEED, 0.0, 0.0))
+
+        # B — oncoming. High relative motion; unambiguous either way.
+        s.vehicle(CONVOY_B_X0 - 11.0 * t, CONVOY_B_Y,
+                  moving=True, velocity=(-11.0, 0.0, 0.0))
+
+        # C — genuinely parked. Appears to move backwards from the vehicle.
+        s.vehicle(CONVOY_C_X, CONVOY_C_Y, length=4.6, width=1.9)
+
+        # A static pedestrian on the pavement, and the far one.
+        s.pedestrian(CONVOY_PED_X, CONVOY_PED_Y)
+        s.pedestrian(FAR_PEDESTRIAN_X, FAR_PEDESTRIAN_Y)
         return s
 
     # ── mixed_urban: everything at once ──────────────────────
@@ -548,6 +596,40 @@ def build_scene(name: str = "mixed_urban", t: float = 0.0, seed: int = 42) -> Sc
     return s
 
 
+#: Raycasting a 64x2048 scan costs ~3 s, so a 12-frame scenario is ~40 s of
+#: pure simulation before anything else can happen. The scenes are
+#: deterministic given a seed, so that work only ever needs doing once: the
+#: result is memoised to disk and every later run of the demo starts warm.
+#: Delete the directory to force regeneration.
+_SCAN_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".scan_cache")
+
+
+def _cache_path(name, frame_idx, seed, rings, az, ego_speed, static_ego):
+    tag = (f"{name}_f{frame_idx}_s{seed}_r{rings}_a{az}"
+           f"_v{ego_speed:g}_{int(static_ego)}")
+    return os.path.join(_SCAN_CACHE_DIR, tag + ".npz")
+
+
+def _load_cached(path):
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            return {k: z[k] for k in z.files}
+    except Exception:
+        return None
+
+
+def _save_cached(path, scan):
+    try:
+        os.makedirs(_SCAN_CACHE_DIR, exist_ok=True)
+        np.savez_compressed(
+            path, **{k: v for k, v in scan.items()
+                     if isinstance(v, np.ndarray)})
+    except Exception:
+        pass        # a cache that cannot be written must never break a run
+
+
 def generate_scenario(
     name: str = "mixed_urban",
     frame_idx: int = 0,
@@ -565,6 +647,16 @@ def generate_scenario(
     """
     fps = 10.0
     t = frame_idx / fps
+
+    cache = _cache_path(name, frame_idx, seed, num_rings, num_azimuth,
+                        ego_speed, static_ego)
+    hit = _load_cached(cache)
+    if hit is not None:
+        hit["frame_id"] = frame_idx
+        hit["timestamp"] = t
+        hit["scenario"] = name
+        return hit
+
     scene = build_scene(name, t=t, seed=seed)
 
     ego_x = 0.0 if static_ego else ego_speed * t
@@ -579,6 +671,7 @@ def generate_scenario(
     pose[2, 3] = scan.pop("sensor_z")
 
     scan["pose"] = pose
+    _save_cached(cache, scan)
     scan["frame_id"] = frame_idx
     scan["timestamp"] = t
     scan["scenario"] = name

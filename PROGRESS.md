@@ -788,3 +788,167 @@ spreading it over terrain.
    are written into the object and printed by every consumer.
 5. **Elevation accuracy is traded for object retention**, quantified in
    `docs/RESULTS.md §2b`.
+
+## PHASE 11 — EGO MOTION AND DYNAMIC SCENE DEMO ✅
+
+**Starting position.** This addendum opens "apply after Part 2 (the 3D scene
+view) is working", but there was no Part 1 or Part 2 in this repository and
+none was specified: no 3D viewer, no camera system, no playback. What existed
+was a 2D top-down raster renderer. The addendum's substance was built on that,
+which is the right surface for the item the addendum itself calls the one that
+matters most — top-follow plus the resolution layer is a top-down view by
+definition.
+
+Four of the five camera presets are genuine top-down cameras. `sensor` is a
+reinterpretation: with no 3D renderer, "first person from the LiDAR origin" is
+served by the range image, which is the projection the sensor really produces
+and every geometric feature is really computed on. That is labelled on screen
+rather than passed off as a perspective render.
+
+### What was built
+
+- `data/synthetic_scene.py` — the `convoy` scenario (F).
+- `visualization/camera.py` — frames of reference, five presets, smooth
+  interpolation between them.
+- `visualization/playback.py` — pre-compute and cache, the swept-corridor
+  accumulator, the wall-thickness probe.
+- `visualization/overlays.py` — ego box, object boxes by state, velocity
+  arrows, predicted path, corridor blend, cell-age tint.
+- `visualization/render.py` — `render_view`, which honours a rotated camera
+  and a frame of reference.
+- `visualization/drive_tab.py` + `app.py` — the Drive tab and three
+  one-click presets.
+
+Storage was not touched. The map stays world-anchored in both frames; the
+frame selector is a transform on the way to pixels. The pipeline runs once
+per frame at load and never again — camera, layer, frame selector and
+scrubbing all read the cache.
+
+### VERIFY
+
+```
+=== A. frame selector ===
+  [PASS] World and Vehicle both offered
+  [PASS] World is the default
+  [PASS] both captions present
+=== B. camera presets ===
+  [PASS] five presets  —  top-follow, chase, world-fixed, sensor, free orbit
+  [PASS] all captioned
+  [PASS] transitions interpolate smoothly  —  rotation 0.00 -> -0.25 -> -0.50
+=== F. convoy relative motion ===
+    A: MOVING                   world 10.27 m/s, relative  0.30 m/s
+    B: MOVING                   world 10.32 m/s, relative 20.32 m/s
+    C: MOVABLE_BUT_STATIONARY   world  2.30 m/s, relative 12.05 m/s
+  [PASS] A (same speed as ego) is MOVING  —  relative 0.30 m/s
+  [PASS] C (parked) is MOVABLE_BUT_STATIONARY
+  [PASS] three states kept distinct
+=== D. swept corridor ===
+  [PASS] corridor accumulates  —  991 m2
+  [PASS] grows monotonically with frame
+  [PASS] survives sliding-window eviction  —  732 -> 991 m2
+=== G. wall thickness ===
+  [PASS] wall stays ~1 cell over the run  —  bulk 0.00 cells over 753 cells,
+         19 m driven (the middle 50% of the facade is a single cell row)
+=== H. playback ===
+  [PASS] four replay speeds, 0.5x present
+  [PASS] all frames cached
+  [PASS] scrubbing is instant from cache  —  62 ms per frame to redraw
+=== presets ===
+  [PASS] three one-click presets
+  [PASS] each sets a full state
+
+18/18 checks passed
+```
+
+Live in Chrome, Drive tab, `mixed_urban` at 12 frames, top-follow +
+resolution level:
+
+```
+  MOS gate                Static sharpness            Swept corridor
+  gate ON                 wall bulk 1.00 cells        480 m² by this frame
+  trail ON  : 0.00 m      (5 cm at 5 cm)              1,006 m² whole route
+  trail OFF : 0.50 m      over 531 cells, 11 m driven
+```
+
+And on `moving_vehicle`, where the trail metric was designed:
+**0.00 m with the gate on, 12.00 m with it off.**
+
+`python -m pytest tests/ -q` — **63 passed**.
+
+### Three real bugs, found by building this
+
+**1. Track origin was captured in the sensor frame.** `_Track.__init__` read
+`inst.centroid`, which is sensor-frame, while the Tracker immediately
+overwrote the state vector with world coordinates. Every stationary track
+therefore accrued the EGO's own displacement: the parked car in `convoy`
+reported having travelled 12 m. Fixed by seeding the origin from the world
+position.
+
+**2. MOVING was decided on instantaneous speed alone**, which cannot work. As
+the ego drives past a stationary car the visible surfaces change, so the
+centroid of the observed points drifts about a metre per frame — the same as
+a car travelling at the ego speed. Measured on `convoy`, both showed ~1 m per
+frame.
+
+The fix is that motion has to be **coherent**, and bounded by the object's own
+size. MOVING now requires speed AND net-displacement-over-path-length ≥ 0.5
+AND displacement greater than the object's own footprint diagonal. Measured:
+
+```
+              displacement   path   straightness   diagonal
+  A moving        19.45 m    19.55      0.99         4.77 m   -> MOVING
+  B oncoming      20.29 m    20.32      1.00         4.78 m   -> MOVING
+  C parked         4.12 m     7.15      0.58         5.01 m   -> MOVABLE_BUT_STATIONARY
+```
+
+This is a change to `perception/tracking.py`'s state rule, which the addendum
+otherwise asked not to touch — but the addendum's own verification requires
+vehicle C to come out MOVABLE_BUT_STATIONARY, and with the old rule it did
+not. No metric and no map behaviour changed.
+
+**3. `vehicle_half_length` took the bounding box of ALL moving points.** With
+two movers fifty metres apart in `convoy` it reported a 26 m "half length",
+which broke the trail metric's exclusion zone. Now grouped by ground-truth
+instance first.
+
+### Two things the isolation test caught
+
+`tests/test_gt_label_isolation.py` failed on `visualization/playback.py`
+reading `gt_moving`. The read was legitimate — the trail metric needs to know
+where the vehicle truly was — but the right home for it is `evaluation/`,
+where ground-truth reads belong and are expected. `moving_object_path` moved
+there; the allowlist stayed tight rather than growing an exception.
+
+The trail metric itself was duplicated between `scripts/test_temporal.py` and
+the new playback module. It now lives once in `evaluation/metrics.py` and both
+import it, so the dashboard and the Phase 6 test cannot drift apart.
+
+### Load time
+
+Raycasting a 64 x 2048 scan costs ~2-3 s, so a 12-frame scenario was ~40 s of
+pure simulation before anything could be shown, and the Drive tab regenerated
+scans the main dashboard had already made. Two fixes:
+
+- scans are memoised to `.scan_cache/` (they are deterministic given a seed),
+  **2.02 s cold to 0.03 s warm, byte-identical**;
+- one scan set is generated per scenario at the longest length anyone asks
+  for and sliced, so the dashboard at 6 frames and the Drive tab at 12 share
+  it.
+
+Drive-tab load fell from ~63 s to ~22 s, and to a few seconds once the cache
+is warm. `.scan_cache/` is gitignored.
+
+### Stills written
+
+`docs/screenshots/foveation_follows_vehicle.png` (the triptych: same camera,
+three points in the run, the fine region travelling with the car),
+`swept_corridor.png`, `drive_tab_topfollow.jpg`.
+
+### Not done
+
+**Nothing was animated into a GIF and no 3D scene view was built.** The five
+presets are top-down cameras, and `sensor` shows the range image rather than
+a synthesised perspective. If a 3D viewer is wanted, that is Part 2 and it
+was never specified.
+
+---
