@@ -51,6 +51,7 @@ and recorded here.
 | 4.6 | `overhead_clearance` stored as a first-class field | Without it, tree canopy over a road puts `z_max` at 4 m and marks drivable road BLOCKED. One 2-byte field removes an entire failure class. |
 | 4.7 | Traversability is computed at query time from stored physical properties, never stored | Drivability is a property of the *vehicle*; slope and step height are properties of the *terrain*. Storing the verdict would bake one vehicle's limits into the map and make the wheeled/tracked toggle impossible. |
 | 4.8 | Free-space carving only at level ≥ 3 (40 cm) | Free space carries no shape information, so fine carving buys nothing and costs 64× the cells of coarse carving. |
+| 4.9 | The cell record is **27 bytes**, not the 22 the brief names | The brief's own field list sums to 27 B: the running total reaches 22 B at `last_seen`, and the five trailing `u8` fields (`intensity_mean`, `intensity_var`, `penetration`, `observability`, `flags`) add 5 more. Every field named in the brief is implemented; the figure is corrected rather than the layout trimmed. `BYTES_PER_CELL` adds the 8-byte Morton key that addresses the cell, giving 35 B of real payload — and `tracemalloc` is what the reported memory figure actually comes from, never this arithmetic. |
 
 ## Phase 5
 

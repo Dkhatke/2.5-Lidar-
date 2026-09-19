@@ -1,177 +1,155 @@
 """
-S2 — Cheap Signal Pass: Ground Separation + Tile Feature Extraction.
+S2 — Cheap Signal Pass: ground separation + tile allocation features.
 
-PROTOTYPE NOTE:
-  Ground separation uses a fast height-grid method.
-  Future replacement: Patchwork++ (labelled clearly in UI).
+No neural network runs here.  Everything is geometric and fully vectorised.
+The original implementation looped over 1600 tiles running a full four-term
+boolean mask over all N points each time — O(1600*N), 862 ms at 120k points.
 
-No neural network runs here. Everything is geometric.
+This version does not even sort.  S1 has already ordered the cloud once by
+level-0 Morton code (``utils/spatial_index.py``), and because the tile is a
+node of the same power-of-two hierarchy, the tile grouping is a run scan over
+that existing order.  Every per-tile statistic is then one ``reduceat``.
+
+A tile carries ALLOCATION features only.  It deliberately carries no semantic
+content: a pedestrian on a road shares a tile with that road, and one
+tile-level class would erase one of them.
 """
 from __future__ import annotations
-import numpy as np
-from typing import Dict, Any, List
 
-from adaptive_lidar.pipeline.types import Frame, PipelineContext, Tile, ResolutionLevel
+from typing import Any, Dict, List
+
+import numpy as np
+
+from adaptive_lidar.perception.ground import GroundSegmenter
 from adaptive_lidar.pipeline.timing import stage_timer
+from adaptive_lidar.pipeline.types import Frame, PipelineContext, Tile
+from adaptive_lidar.utils.grouping import (
+    group_sizes,
+    segment_bincount,
+    segment_percentile_sorted,
+    segment_reduce,
+    segment_sort,
+)
+from adaptive_lidar.utils.spatial_index import TILE_SIZE
 
 
 class S2Geometry:
     def __init__(self, config: Dict[str, Any]):
         self.cfg = config
+        self.tsize = TILE_SIZE
+        self.ground = GroundSegmenter(config)
 
-    # ── Ground separation ─────────────────────────────────────
-    def _ground_separate(self, points: np.ndarray) -> np.ndarray:
-        """
-        PROTOTYPE: height-grid ground segmentation.
-        Future replacement: Patchwork++
-        Returns boolean mask (True = ground).
-        """
-        gt_cfg = self.cfg.get("thresholds", {}).get("ground", {})
-        h_thresh = gt_cfg.get("height_threshold", 0.3)
-        grid_res = gt_cfg.get("grid_resolution", 1.0)
-        sensor_h = self.cfg.get("sensor", {}).get("height", 1.8)
-
-        x, y, z = points[:, 0], points[:, 1], points[:, 2]
-
-        # Build 2D height grid — minimum z per cell
-        gx = np.floor(x / grid_res).astype(np.int32)
-        gy = np.floor(y / grid_res).astype(np.int32)
-
-        # Offset to make indices non-negative
-        gx_off = gx - gx.min()
-        gy_off = gy - gy.min()
-
-        gW = gx_off.max() + 1
-        gH = gy_off.max() + 1
-
-        min_z_grid = np.full((gH, gW), np.inf, dtype=np.float32)
-        np.minimum.at(min_z_grid, (gy_off, gx_off), z)
-
-        # Replace inf with 0
-        min_z_grid[min_z_grid == np.inf] = 0.0
-
-        # Per-point: local minimum z from its grid cell
-        local_min_z = min_z_grid[gy_off, gx_off]
-
-        # Ground: close to local minimum and below sensor height
-        ground_mask = (
-            (z - local_min_z < h_thresh) &
-            (z < sensor_h * 0.5)
-        )
-        return ground_mask.astype(bool)
-
-    # ── Tile grid ─────────────────────────────────────────────
-    def _build_tiles(self, points: np.ndarray) -> List[Tile]:
-        tile_cfg = self.cfg.get("tiles", {})
-        tsize = tile_cfg.get("size", 2.0)
-        xr = tile_cfg.get("x_range", [-40, 40])
-        yr = tile_cfg.get("y_range", [-40, 40])
-
-        xs = np.arange(xr[0], xr[1], tsize)
-        ys = np.arange(yr[0], yr[1], tsize)
-
-        tiles: List[Tile] = []
-        tid = 0
-        for ixi, tx in enumerate(xs):
-            for iyi, ty in enumerate(ys):
-                cx = tx + tsize / 2
-                cy = ty + tsize / 2
-                # Points inside this tile
-                in_tile = (
-                    (points[:, 0] >= tx) & (points[:, 0] < tx + tsize) &
-                    (points[:, 1] >= ty) & (points[:, 1] < ty + tsize)
-                )
-                idx = np.where(in_tile)[0].astype(np.int32)
-                t = Tile(tile_id=tid, ix=ixi, iy=iyi, cx=cx, cy=cy,
-                         point_indices=idx)
-                tiles.append(t)
-                tid += 1
-        return tiles
-
-    # ── Per-tile geometry features ────────────────────────────
-    def _compute_tile_features(
-        self,
-        tile: Tile,
-        points: np.ndarray,
-        intensity: np.ndarray,
-        ground_mask: np.ndarray,
-        tsize: float,
-    ):
-        idx = tile.point_indices
-        tile.point_count = len(idx)
-
-        if len(idx) == 0:
-            tile.density = 0.0
-            tile.height_variance = 0.0
-            tile.height_mean = 0.0
-            tile.verticality = 0.0
-            tile.range_mean = float(np.sqrt(tile.cx**2 + tile.cy**2))
-            tile.roughness = 0.0
-            tile.boundary_score = 0.0
-            tile.intensity_mean = 0.0
-            return
-
-        pts = points[idx]
-        z = pts[:, 2]
-        r = np.linalg.norm(pts, axis=1)
-
-        tile.density = len(idx) / (tsize * tsize)
-        tile.height_variance = float(np.var(z))
-        tile.height_mean = float(np.mean(z))
-        tile.range_mean = float(np.mean(r))
-        tile.intensity_mean = float(np.mean(intensity[idx]))
-
-        # Verticality — ratio of non-ground points with significant height
-        ng = ~ground_mask[idx]
-        non_ground_pts = pts[ng]
-        if len(non_ground_pts) > 3:
-            z_ng = non_ground_pts[:, 2]
-            z_spread = z_ng.max() - z_ng.min()
-            tile.verticality = min(z_spread / 3.0, 1.0)  # normalised to ~3m max
-        else:
-            tile.verticality = 0.0
-
-        # Roughness — std of residuals from mean z
-        if len(idx) > 2:
-            tile.roughness = float(np.std(z))
-        else:
-            tile.roughness = 0.0
-
-        # Boundary score — gradient of point density at edges
-        # Simplified: how different is density in adjacent quadrants
-        half = tsize / 4.0
-        cx, cy = tile.cx, tile.cy
-        def quad_count(xsign, ysign):
-            mask = (
-                ((pts[:, 0] - cx) * xsign >= 0) &
-                ((pts[:, 1] - cy) * ysign >= 0)
-            )
-            return mask.sum()
-        counts = [quad_count(1,1), quad_count(-1,1),
-                  quad_count(1,-1), quad_count(-1,-1)]
-        if max(counts) > 0:
-            tile.boundary_score = float(np.std(counts) / (np.mean(counts) + 1e-6))
-            tile.boundary_score = min(tile.boundary_score, 1.0)
-        else:
-            tile.boundary_score = 0.0
-
-    # ── Main process ──────────────────────────────────────────
     def process(self, frame: Frame, ctx: PipelineContext):
         with stage_timer("S2", frame.timing):
-            points = frame.points
-            intensity = frame.intensity
+            pts = frame.points
+            n = len(pts)
 
-            # Ground separation
-            ground_mask = self._ground_separate(points)
-            frame.ground_mask = ground_mask
-            frame.non_ground_mask = ~ground_mask
+            # -- Ground separation + smooth height field --------
+            gmask, gz, hag = self.ground(
+                pts,
+                range_image=frame.range_image,
+                range_image_valid=frame.range_image_valid,
+                elev_angles_deg=getattr(frame, "_elev_angles_deg", None),
+                index=getattr(frame, "morton", None),
+            )
+            frame.ground_mask = gmask
+            frame.non_ground_mask = ~gmask
+            frame.ground_z = gz
+            frame.height_above_gnd = hag
+            frame.timing["S2_ground_method"] = self.ground.active
 
-            # Build tile grid
-            tsize = self.cfg.get("tiles", {}).get("size", 2.0)
-            tiles = self._build_tiles(points)
+            if n == 0:
+                frame.tiles = []
+                frame.tile_of_point = np.zeros(0, dtype=np.int32)
+                return
 
-            # Compute per-tile geometry features
-            for tile in tiles:
-                self._compute_tile_features(tile, points, intensity, ground_mask, tsize)
+            mi = frame.morton
+            order = mi.order
+            starts = mi.tile_starts
+            m = mi.n_tiles
+            frame.tile_of_point = mi.tile_of_point
+
+            # -- Per-tile reductions, all on the existing order -
+            z = pts[:, 2].astype(np.float32)
+            r = frame._range
+            inten = frame.intensity.astype(np.float32)
+
+            zs = z[order]
+            counts = group_sizes(starts).astype(np.int32)
+            z_mean = segment_reduce(zs, starts, "mean")
+            z_var = segment_reduce(zs, starts, "var")
+            r_mean = segment_reduce(r[order], starts, "mean")
+            i_mean = segment_reduce(inten[order], starts, "mean")
+
+            hs = hag.astype(np.float32)[order]
+            # Non-ground vertical spread: ground points sit near zero, so the
+            # max height above ground IS the spread that matters.
+            z_spread = np.maximum(segment_reduce(hs, starts, "max"), 0.0)
+
+            # Largest empty vertical band in the tile - a bridge, a canopy, or
+            # a torso above legs. One sort serves both order statistics.
+            hp = segment_percentile_sorted(
+                segment_sort(hs, starts), starts, [60, 90])
+            hist_gap = np.maximum(hp[:, 1] - hp[:, 0], 0.0)
+
+            # Roughness: spread of the GROUND points only, so a wall face does
+            # not read as rough terrain.
+            gsel = gmask[order].astype(np.float32)
+            gz_only = np.where(gsel > 0, zs, 0.0)
+            g_cnt = np.maximum(segment_reduce(gsel, starts, "sum"), 1.0)
+            g_mean = segment_reduce(gz_only, starts, "sum") / g_cnt
+            g_sq = segment_reduce(gz_only * gz_only, starts, "sum") / g_cnt
+            roughness = np.sqrt(np.maximum(g_sq - g_mean * g_mean, 0.0))
+
+            # Boundary score: quadrant occupancy imbalance inside the tile.
+            tix, tiy = mi.tile_indices()
+            gid = np.repeat(np.arange(m, dtype=np.int64), counts.astype(np.int64))
+            local_x = pts[order, 0] - tix[gid].astype(np.float32) * self.tsize
+            local_y = pts[order, 1] - tiy[gid].astype(np.float32) * self.tsize
+            half = self.tsize / 2.0
+            quad = ((local_x > half).astype(np.int64) * 2
+                    + (local_y > half).astype(np.int64))
+            qhist = segment_bincount(quad, starts, 4).astype(np.float32)
+            boundary = np.clip(
+                qhist.std(axis=1) / (qhist.mean(axis=1) + 1e-6), 0.0, 1.0)
+
+            verticality = np.clip(z_spread / 3.0, 0.0, 1.0)
+            density = counts / (self.tsize * self.tsize)
+            cx, cy = mi.tile_centres()
+
+            # -- Materialise Tile objects -----------------------
+            # One Python object per OCCUPIED tile (typically 400-3000), never
+            # per point. Point indices are a slice of the shared order.
+            tiles: List[Tile] = []
+            for j in range(m):
+                t = Tile(tile_id=j, ix=int(tix[j]), iy=int(tiy[j]),
+                         cx=float(cx[j]), cy=float(cy[j]))
+                t.point_count = int(counts[j])
+                t.density = float(density[j])
+                t.height_variance = float(z_var[j])
+                t.height_mean = float(z_mean[j])
+                t.range_mean = float(r_mean[j])
+                t.intensity_mean = float(i_mean[j])
+                t.verticality = float(verticality[j])
+                t.roughness = float(roughness[j])
+                t.boundary_score = float(boundary[j])
+                t.z_spread = float(z_spread[j])
+                t.histogram_gap = float(hist_gap[j])
+                tiles.append(t)
 
             frame.tiles = tiles
+            frame._tile_order = order
+            frame._tile_starts = starts
+
+            frame.timing["S2_diag"] = {
+                "n_tiles": m,
+                "tile_size_m": self.tsize,
+                "ground_fraction": float(gmask.mean()),
+                "ground_method": self.ground.active,
+            }
+
+
+def tile_point_indices(frame: Frame, tile_id: int) -> np.ndarray:
+    """Point indices of one tile - a slice of the shared order, not a copy."""
+    s = frame._tile_starts
+    return frame._tile_order[s[tile_id]:s[tile_id + 1]]

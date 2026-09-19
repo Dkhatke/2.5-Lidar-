@@ -1,20 +1,30 @@
 """
 Config loader — single source of truth.
-Reads config.yaml and provides typed access.
+
+Reads config.yaml and provides typed access.  Files are opened as UTF-8
+explicitly: Python on Windows defaults to the cp1252 locale encoding, which
+fails on any non-ASCII character in the file.
 """
+from __future__ import annotations
+
+import io
 import os
-import yaml
 from typing import Any, Dict
+
+import yaml
 
 _CONFIG: Dict[str, Any] = {}
 
 
-def load_config(path: str = None) -> Dict[str, Any]:
+def default_path() -> str:
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(here, "config.yaml")
+
+
+def load_config(path: str | None = None) -> Dict[str, Any]:
     global _CONFIG
-    if path is None:
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(here, "config.yaml")
-    with open(path, "r") as f:
+    path = path or default_path()
+    with io.open(path, "r", encoding="utf-8") as f:
         _CONFIG = yaml.safe_load(f)
     return _CONFIG
 
@@ -27,5 +37,4 @@ def get_config() -> Dict[str, Any]:
 
 
 def get(section: str, key: str, default=None):
-    cfg = get_config()
-    return cfg.get(section, {}).get(key, default)
+    return get_config().get(section, {}).get(key, default)

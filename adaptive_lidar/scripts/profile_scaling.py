@@ -45,16 +45,18 @@ def _resample(cloud: np.ndarray, n_target: int, rng: np.random.Generator) -> np.
     return out
 
 
-def _make_cloud(n_target: int, rng: np.random.Generator) -> np.ndarray:
-    """Build a synthetic cloud of approximately n_target points."""
-    try:
-        from adaptive_lidar.data.synthetic_scene import generate_scenario
-        scene = generate_scenario("mixed_urban", frame_idx=0)
-        cloud = np.column_stack([scene["points"], scene["intensity"]]).astype(np.float32)
-    except Exception:
-        from adaptive_lidar.data.synthetic_scene import generate_scene
-        cloud = generate_scene(0, 8)
-    return _resample(cloud, n_target, rng)
+def _make_cloud(n_target: int, rng: np.random.Generator):
+    """Build a synthetic scan of approximately n_target points.
+
+    Sensor resolution is scaled rather than the scene resampled, so the beam
+    geometry stays real at every size: a 30k-point scan is a genuine 32-ring
+    sweep, not a decimated 64-ring one.
+    """
+    from adaptive_lidar.data.synthetic_scene import generate_scenario
+    rings, az = {8_000: (16, 512), 30_000: (32, 1024),
+                 120_000: (64, 2048)}.get(n_target, (64, 2048))
+    return generate_scenario("mixed_urban", frame_idx=0,
+                             num_rings=rings, num_azimuth=az)
 
 
 def main():
@@ -64,6 +66,7 @@ def main():
                     help="frames per size (first frame discarded as warm-up)")
     ap.add_argument("--budget", type=float, default=0.8)
     ap.add_argument("--backend", default="auto")
+    ap.add_argument("--policy", default="full")
     args = ap.parse_args()
 
     from adaptive_lidar.utils.config import load_config
@@ -76,7 +79,7 @@ def main():
     for n_target in TARGETS:
         cloud = _make_cloud(n_target, rng)
         pipe = Pipeline(config)
-        pipe.build_stages(backend=args.backend)
+        pipe.build_stages(backend=args.backend, policy=args.policy)
         pipe.set_budget(args.budget)
 
         per_stage = {s: [] for s in STAGES}

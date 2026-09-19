@@ -1,19 +1,35 @@
 """
-S4 — Foveated Sparse Semantic Perception.
+S4 — Per-Point Semantic Perception.
 
-ONLY processes tiles that were SELECTED in S3/S6.
-This is the core of the adaptive computation idea:
-  ~10–30% of tiles enter S4, not 100%.
+Produces ``frame.sem_evidence`` (N, 6), ``frame.sem_class`` (N,) and
+``frame.sem_entropy`` (N,) — one classification per POINT.
 
-The active backend is chosen by sparse_backend.build_backend().
+This is the fix for BROKEN 2.  The previous implementation classified whole
+2 m x 2 m tiles, so a pedestrian standing on a road shared one label with the
+road and one of the two was erased.  Per-point evidence makes the headline
+claim demonstrable and per-point accuracy computable.
+
+Tile-level ``semantic_class`` survives only as a DERIVED display field
+(the argmax of the tile's summed point evidence).  It is never an input to map
+fusion or to allocation.
+
+Also computes the geometry<->semantics disagreement signal (Phase 3.6): two
+independent estimators of "is this ground" — the geometric ground mask and the
+network's ground-class prediction — disagreeing is free epistemic uncertainty,
+with no ensemble to train or run.
 """
 from __future__ import annotations
-import numpy as np
-from typing import Dict, Any
 
-from adaptive_lidar.pipeline.types import Frame, PipelineContext, ResolutionLevel
+from typing import Any, Dict
+
+import numpy as np
+
+from adaptive_lidar.perception.backends import build_backend, evidence_to_class_entropy
 from adaptive_lidar.pipeline.timing import stage_timer
-from adaptive_lidar.perception.sparse_backend import build_backend
+from adaptive_lidar.pipeline.types import CLASS_IMPORTANCE, NUM_CLASSES, Frame, PipelineContext
+from adaptive_lidar.utils.grouping import segment_reduce
+
+GROUND_CLASSES = (0, 1)
 
 
 class S4Semantics:
@@ -21,97 +37,117 @@ class S4Semantics:
         self.cfg = config
         self._backend = build_backend(mode=backend, config=config)
         self.backend_name = self._backend.name
+        self.disagreement_boost = float(
+            config.get("semantics", {}).get("disagreement_entropy_boost", 0.35))
 
     def process(self, frame: Frame, ctx: PipelineContext):
         with stage_timer("S4", frame.timing):
-            if not frame.tiles:
+            n = len(frame.points)
+            if n == 0:
+                frame.sem_evidence = np.zeros((0, NUM_CLASSES), np.float32)
+                frame.sem_class = np.zeros(0, np.int8)
+                frame.sem_entropy = np.zeros(0, np.float32)
                 return
 
-            points = frame.points
-            intensity = frame.intensity
-            ground_mask = frame.ground_mask
-            if ground_mask is None:
-                ground_mask = np.zeros(len(points), dtype=bool)
+            # ── per-point inference ───────────────────────────
+            ev = self._backend.predict(frame).astype(np.float32)
+            cls, ent = evidence_to_class_entropy(ev)
 
-            selected_count = 0
-            for tile in frame.tiles:
-                if not tile.selected:
-                    # Default to geometry-prior for non-selected tiles
-                    tile.semantic_probs = np.array(
-                        [0.5, 0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float32)
-                    tile.semantic_class = 0
-                    tile.semantic_confidence = 0.5
-                    tile.semantic_uncertainty = 0.5
-                    continue
+            # ── geometry <-> semantics disagreement ───────────
+            # Two independent estimators of "is this ground".
+            gmask = frame.ground_mask
+            if gmask is not None:
+                sem_ground = np.isin(cls, GROUND_CLASSES)
+                disagree = sem_ground != gmask
+                ent = np.clip(ent + self.disagreement_boost * disagree, 0.0, 1.0)
+                frame._geom_sem_disagree = disagree
+            else:
+                frame._geom_sem_disagree = np.zeros(n, bool)
 
-                selected_count += 1
-                idx = tile.point_indices
+            frame.sem_evidence = ev
+            frame.sem_class = cls
+            frame.sem_entropy = ent
+            # legacy aliases
+            frame.semantic_labels = cls.astype(np.int32)
+            frame.semantic_confidence = ev.max(axis=1)
 
-                if len(idx) == 0:
-                    tile.semantic_probs = np.ones(6, dtype=np.float32) / 6
-                    tile.semantic_class = 0
-                    tile.semantic_confidence = 1.0 / 6
-                    tile.semantic_uncertainty = 1.0
-                    continue
+            # ── tile roll-up: ALLOCATION features only ────────
+            self._rollup_tiles(frame)
 
-                tile_pts = points[idx]
-                tile_gnd = ground_mask[idx]
-                tile_int = intensity[idx]
-                vsize = ResolutionLevel.size(tile.resolution_level)
+            frame.timing["S4_diag"] = {
+                "backend": self.backend_name,
+                "mean_entropy": float(ent.mean()),
+                "disagreement_rate": float(frame._geom_sem_disagree.mean()),
+                "class_hist": np.bincount(
+                    np.clip(cls, 0, NUM_CLASSES - 1), minlength=NUM_CLASSES).tolist(),
+            }
 
-                # Dispatch to the active backend
-                backend = self._backend
-                if hasattr(backend, "predict_tile"):
-                    try:
-                        if hasattr(backend, '_net'):  # PrototypeSparseBackend
-                            probs, conf, unc = backend.predict_tile(
-                                points=tile_pts,
-                                ground_mask=tile_gnd,
-                                height_mean=tile.height_mean,
-                                height_variance=tile.height_variance,
-                                intensity_mean=tile.intensity_mean,
-                                voxel_size=vsize,
-                            )
-                        else:  # GeometryFallbackBackend or other
-                            probs, conf, unc = backend.predict_tile(
-                                tile_pts, tile_gnd,
-                                tile.height_mean, tile.height_variance,
-                                tile.verticality, tile.roughness,
-                            )
-                    except Exception:
-                        # Fallback to geometry rules
-                        from adaptive_lidar.perception.geometry_fallback import (
-                            GeometryFallbackBackend,
-                        )
-                        fb = GeometryFallbackBackend()
-                        probs, conf, unc = fb.predict_tile(
-                            tile_pts, tile_gnd,
-                            tile.height_mean, tile.height_variance,
-                            tile.verticality, tile.roughness,
-                        )
-                else:
-                    raise RuntimeError(f"Backend {backend} missing predict_tile()")
-
-                tile.semantic_probs = probs.astype(np.float32)
-                tile.semantic_class = int(np.argmax(probs))
-                tile.semantic_confidence = float(conf)
-                tile.semantic_uncertainty = float(unc)
-
-                # Geometry-semantic disagreement — raises uncertainty
-                _check_disagreement(tile)
-
-                # Uncertainty feedback: update score_uncertainty for S6
-                tile.score_uncertainty = max(tile.score_uncertainty, tile.semantic_uncertainty)
-
-        # Update telemetry on context
         ctx.semantic_backend_name = self.backend_name
 
+    # ────────────────────────────────────────────────────────
+    def _rollup_tiles(self, frame: Frame):
+        """Aggregate per-point signals onto tiles for the allocation controller.
 
-def _check_disagreement(tile):
-    """
-    Geometry says obstacle (high verticality) but semantics says ground?
-    Raise uncertainty to flag for higher allocation in S6.
-    """
-    if tile.verticality > 0.5 and tile.semantic_class in (0, 1):
-        # geometry says obstacle, semantics says ground → disagreement
-        tile.semantic_uncertainty = min(tile.semantic_uncertainty + 0.2, 1.0)
+        Max-reductions, not means: a tile containing one pedestrian must report
+        VRU-level stake even when 400 road points outnumber them 400:1.
+
+        The grouping is the frame's existing Morton ordering — re-sorting the
+        cloud here to recover a grouping S2 already computed was costing about
+        as much as the semantic inference itself.
+        """
+        tiles = frame.tiles
+        mi = getattr(frame, "morton", None)
+        if not tiles or mi is None or mi.n_tiles == 0:
+            return
+
+        order = mi.order
+        starts = mi.tile_starts
+        m = mi.n_tiles
+
+        importance = CLASS_IMPORTANCE[np.clip(frame.sem_class, 0, NUM_CLASSES - 1)]
+        max_imp = segment_reduce(importance[order], starts, "max")
+        max_ent = segment_reduce(frame.sem_entropy[order], starts, "max")
+        ev_sum = segment_reduce(frame.sem_evidence[order], starts, "sum")
+
+        run = getattr(frame, "_vertical_run", None)
+        if run is not None:
+            max_run = segment_reduce(run[order].astype(np.float32), starts, "max")
+            hag_max = segment_reduce(frame.height_above_gnd[order], starts, "max")
+            nbr = getattr(frame, "_features", None)
+            nbr = (nbr[:, 9] if nbr is not None
+                   else np.zeros(len(frame.points), np.float32))
+            min_nbr = segment_reduce(nbr[order], starts, "min")
+        else:
+            max_run = np.zeros(m, np.float32)
+            hag_max = np.zeros(m, np.float32)
+            min_nbr = np.zeros(m, np.float32)
+
+        # THE GEOMETRIC SAFETY PIN: a run of >= 4 consecutive rings at one
+        # azimuth, standing above the ground, in a sparse neighbourhood.
+        # "Small, isolated, vertically extended" - without knowing what it is.
+        pin = (max_run >= 4) & (hag_max > 0.4) & (min_nbr < 40)
+
+        # Occlusion-aware density: how many real beams reached this tile.
+        # Point count alone conflates "nothing is there" with "the view was
+        # blocked"; a tile hit by many beams that returned nothing is genuinely
+        # empty, one hit by three beams is merely unobserved.
+        ring = frame.ring
+        valid_px = (segment_reduce((ring[order] >= 0).astype(np.float32),
+                                   starts, "sum").astype(np.int32)
+                    if ring is not None else np.zeros(m, np.int32))
+
+        probs = ev_sum / np.maximum(ev_sum.sum(axis=1, keepdims=True), 1e-9)
+        cls = np.argmax(probs, axis=1)
+        conf = probs.max(axis=1)
+
+        for j in range(m):
+            t = tiles[j]
+            t.max_class_importance = float(max_imp[j])
+            t.max_entropy = float(max_ent[j])
+            t.has_vertical_run = bool(pin[j])
+            t.valid_pixel_count = int(valid_px[j])
+            t.semantic_probs = probs[j].astype(np.float32)
+            t.semantic_class = int(cls[j])
+            t.semantic_confidence = float(conf[j])
+            t.semantic_uncertainty = float(max_ent[j])
+            t.score_uncertainty = max(t.score_uncertainty, float(max_ent[j]))

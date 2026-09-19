@@ -1,80 +1,128 @@
 # ============================================================
-# SIH26 — Adaptive Foveated 2.5D LiDAR Perception
-# Configuration — All constants live here, never scattered in code
+# SIH26 / DRDO PS 26053
+# Adaptive Variable-Resolution 2.5D LiDAR Mapping
+# Configuration — all constants live here, never scattered in code
 # ============================================================
 
 sensor:
-  max_range: 75.0          # metres
-  min_range: 0.3
-  vertical_fov: 30.0       # degrees total (±15)
-  horizontal_resolution: 0.2  # degrees
+  max_range: 100.0         # metres
+  min_range: 0.5
   num_rings: 64
+  num_azimuth: 2048        # azimuth bins per rotation
+  elev_min_deg: -24.0      # beam elevation envelope (HDL-64E / OS1-64 class)
+  elev_max_deg: 2.0
   height: 1.8              # sensor mount height above ground (m)
 
+perception:
+  # range_image_method: auto | native | unfold | spherical
+  #   auto    — native ring/azimuth when the sensor supplies them, else unfold
+  #   unfold  — scan unfolding from firing order (SemanticKITTI)
+  #   spherical — elevation binning; lossy, kept for the comparison metric
+  range_image_method: auto
+  # ground_method: auto | ring_geometry | height_grid | patchwork
+  ground_method: auto
+  # semantic backend: auto | pointfeature_net | geometry_rules | oracle
+  backend: auto
+
 voxel:
-  query_size: 0.25         # S1 coarse query index voxel size (m)
+  query_size: 0.5          # S1 query index voxel size (m) — also the MLP's
+                           # neighbour-count feature radius
 
 tiles:
-  size: 2.0                # tile edge length (m)
-  x_range: [-40, 40]       # metres around ego
-  y_range: [-40, 40]
+  # 1.6 m = 0.05 x 2^5 — the allocation unit is a NODE OF THE MAP'S OWN
+  # power-of-two hierarchy, so a tile id is literally a prefix of the level-0
+  # Morton code. A tile boundary can therefore never fall inside a map cell,
+  # and one sort of the cloud groups it by tile and by cell at every level at
+  # once. Changing this away from a power-of-two multiple of 0.05 breaks both
+  # properties. See utils/spatial_index.py.
+  size: 1.6                # allocation unit edge length (m)
+  x_range: [-110, 110]     # metres around ego
+  y_range: [-110, 110]
 
+# ── Resolution hierarchy ────────────────────────────────────
+# Powers of two, NOT the PS's illustrative 50 cm. The level-l cell id is the
+# level-0 Morton code >> 2l, so a fine cell is always wholly inside exactly one
+# coarse cell — which is what makes the 3D→2.5D projection free of alignment
+# errors and data loss by construction. See DECISIONS.md 4.1.
 resolution:
+  base: 0.05
   levels:
     LEVEL_0: 0.05          # finest — 5 cm
     LEVEL_1: 0.10
     LEVEL_2: 0.20
     LEVEL_3: 0.40
     LEVEL_4: 0.80          # coarsest — 80 cm
-  thresholds:
-    # threshold_mode: "percentile" uses distribution-aware thresholds
-    # threshold_mode: "absolute"  uses absolute V score cutoffs
-    threshold_mode: "percentile"
-    high_percentile: 75      # top 25% of occupied tiles → LEVEL_0 (HIGH)
-    medium_percentile: 40    # top 60% of occupied tiles → LEVEL_1/2 (MEDIUM)
-    # Fallback absolute thresholds (used when threshold_mode=absolute):
-    high: 0.45
-    medium: 0.22
-    low: 0.0
+
+# ── Allocation controller ───────────────────────────────────
+allocation:
+  # policy: uniform_5 | uniform_10 | uniform_20 | uniform_40 | uniform_80
+  #       | distance_only | distance_geometry | distance_geometry_semantic
+  #       | distance_geometry_semantic_uncertainty | full | random
+  policy: full
+  min_points_per_child: 4  # refinement gate: never split below this
+  braking_envelope: 30.0   # metres ahead, for the collision-band pin
+  collision_band: [0.3, 2.5]
+  enforce_continuity: true # 2:1 level continuity between adjacent tiles
+  pin_level: 0             # tier-1 pins (small hazards) go to 5 cm
+  pin_level_coarse: 2      # tier-2 pins (extended structure) go to 20 cm
+  max_cells: 1500000
+  random_seed: 7
+  # Resolution law: cell size ∝ r, anchored 5 cm at 10 m → 50 cm at 100 m.
+  law_anchor_range: 10.0
+  law_anchor_size: 0.05
+  law_exponent: 1.0
+  target_points_per_cell: 4.0
 
 budget:
-  default: 0.80            # fraction of compute budget (1.0 = full)
-  min_safety_budget: 0.05  # safety-pinned tiles always allocated
+  default: 0.60            # fraction of the unconstrained cell budget
 
 weights:
-  geometry: 0.35
-  semantic: 0.20
-  uncertainty: 0.25
+  geometry: 0.30
+  semantic: 0.30
+  uncertainty: 0.20
   dynamic: 0.20
 
 thresholds:
-  motion:
-    displacement: 0.3      # metres per frame to classify as MOVING
-    probability: 0.55
   obstacle:
-    height: 0.4            # min z above ground to be an obstacle
-    min_points: 5
-  uncertainty:
-    low_density_points: 10
-    semantic: 0.4          # uncertainty > this → raise priority
-  safety:
-    max_range_pin: 20.0    # tiles within this range with obstacle → pinned
-    pedestrian_height_max: 2.2
-    pedestrian_height_min: 0.5
-    pedestrian_footprint_max: 1.5
-    pedestrian_min_points: 8
+    height: 0.30           # min height above ground for the existential rule
+    min_points: 1          # existential: ONE point is enough
   ground:
-    height_threshold: 0.3  # points within this of grid floor are ground
+    height_threshold: 0.30
     grid_resolution: 1.0
 
+# ── Motion / MOS gate ───────────────────────────────────────
+motion:
+  gate_enabled: true       # set false for the trail ablation
+  gate_threshold: 0.5
+  residual_window: 3
+  residual_tolerance: 0.45
+  instance_voxel: 0.4
+  min_instance_voxels: 3
+
+tracking:
+  gate_distance: 3.5
+  class_mismatch_penalty: 2.5
+  max_misses: 3
+  min_speed: 0.6           # m/s above which a movable track is MOVING
+  confirm_observations: 2
+  process_noise_pos: 0.05
+  process_noise_vel: 2.0
+  measurement_noise: 0.15
+
+# ── Map ─────────────────────────────────────────────────────
 map:
-  resolution: 0.25         # default map cell size (m) — coarser is faster
-  temporal_decay: 0.80     # weight of previous observation (lower = faster update)
-  unknown_flag: true
-  log_odds_free: -0.3
-  log_odds_occupied: 0.5
-  log_odds_min: -2.0
-  log_odds_max: 2.0
+  vehicle_clearance_height: 2.5   # clearance band top (m above ground)
+  multi_surface_gap: 0.5          # empty vertical band → multi-surface flag
+  carve_free_space: true
+  carve_min_level: 3              # free space carved at 40 cm only
+  window_size: 200.0              # sliding world window (m)
+  decay_every_frames: 10
+  log_odds_free: -0.4
+  log_odds_occupied: 0.85
+  log_odds_min: -4.0
+  log_odds_max: 5.0
+  occupied_logodds: 0.5
+  free_logodds: -0.5
 
 semantics:
   classes:
@@ -85,48 +133,30 @@ semantics:
     - vru
     - vegetation
   num_classes: 6
-  # Use geometry fallback as primary when neural backend confidence < threshold
-  confidence_fallback_threshold: 0.45
+  disagreement_entropy_boost: 0.35
 
 pipeline:
-  target_latency_ms: 40.0  # conceptual future target — NOT a claim
-  max_frames_history: 5
+  target_latency_ms: 100.0        # the PS's requirement at 120k points
+  max_frames_history: 4
 
-# ============================================================
-# Synthetic driving scene configuration
-# ============================================================
+# ── Synthetic scene ─────────────────────────────────────────
 synthetic:
-  seed: 42                 # reproducible scene generation
-  fps: 10                  # frames per second (for motion simulation)
-  road_length: 120.0       # metres forward
-  road_width: 7.0          # metres (two lanes)
-  building_offset: 6.0     # metres from road edge to buildings
+  seed: 42
+  fps: 10
+  ego_speed: 10.0          # m/s
+  scenario: mixed_urban
+  scenarios:
+    - empty_road
+    - pedestrian_far
+    - canopy_over_road
+    - moving_vehicle
+    - mixed_urban
 
-camera:
-  enabled: true
-  width: 640
-  height: 360
-  fov_deg: 90.0            # horizontal field of view
-  mount_height: 1.5        # metres above ground
-  near_clip: 1.0           # metres
-
-lidar_sim:
-  channels: 64
-  horizontal_points: 1024
-  max_range: 80.0
-  noise_std: 0.03          # range noise standard deviation (m)
-  dropout_prob: 0.005      # random beam dropout fraction
-  intensity_ground: 0.3
-  intensity_obstacle: 0.6
-  intensity_vehicle: 0.7
-
-# ============================================================
-# Evaluation configuration
-# ============================================================
+# ── Evaluation ──────────────────────────────────────────────
 evaluation:
-  enabled: true
-  min_iou_threshold: 0.25  # minimum IoU to count as detected
-  comparison_modes:
-    - full
-    - adaptive
-    - low_budget
+  range_bands: [[0, 10], [10, 30], [30, 60], [60, 100]]
+  orr_min_cells: 3         # cells needed to count an object as retained
+  orr_min_points: 10       # points needed to count an object as observed
+  reference_frames: 50     # frames accumulated for the reference map
+  reference_resolution: 0.05
+  budgets: [1.0, 0.75, 0.5, 0.25, 0.1]

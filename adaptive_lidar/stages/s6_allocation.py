@@ -1,137 +1,104 @@
 """
-S6 — Final Allocation (Refined After S4 + S5).
+S6 — Final Allocation (the closed feedback loop).
 
-Re-runs resolution assignment using:
-  - S4 semantic uncertainty (if confidence < fallback threshold, U is raised)
-  - S5 motion probability (D is updated from centroid tracking)
-  - Updated score_uncertainty / score_dynamic per tile
+Re-runs the allocation controller with everything S4 and S5 discovered:
 
-S3: preliminary — geometry only
-S6: refined — geometry + semantics + motion (CLOSED FEEDBACK LOOP)
+    S4 entropy      -> U term  -> rho up -> finer
+    S4 disagreement -> U term
+    S5 moving_prob  -> D term
+    geometric run   -> SAFETY PIN (not a term — a constraint)
 
-This is one of the key innovations:
-
-S4 uncertainty ↑  →  score_uncertainty ↑  →  priority ↑  →  resolution ↑
-S5 motion ↑       →  score_dynamic ↑     →  priority ↑  →  resolution ↑
-
-Telemetry records before/after priority changes for explainability.
+and writes the per-point resolution level onto the frame.  That last step is
+the fix for BROKEN 1: previously the level was computed here, shown in the
+dashboard, and then thrown away, and the map was built at one uniform cell
+size regardless.
 """
 from __future__ import annotations
-import numpy as np
-from typing import Dict, Any
 
-from adaptive_lidar.pipeline.types import Frame, PipelineContext, ResolutionLevel
+from typing import Any, Dict
+
+import numpy as np
+
+from adaptive_lidar.mapping.allocation import (
+    AllocationController,
+    levels_to_points,
+    tile_cells_at_level,
+)
 from adaptive_lidar.pipeline.timing import stage_timer
+from adaptive_lidar.pipeline.types import Frame, PipelineContext, VehicleProfile
 
 
 class S6Allocation:
     def __init__(self, config: Dict[str, Any]):
         self.cfg = config
+        self.ctrl = AllocationController(config)
+        self.profile = VehicleProfile.wheeled()
 
     def process(self, frame: Frame, ctx: PipelineContext):
         with stage_timer("S6", frame.timing):
-            if not frame.tiles:
+            tiles = frame.tiles
+            n = len(frame.points)
+            if not tiles:
+                frame.point_level = np.full(n, 4, np.int8)
                 return
 
-            weights = self.cfg.get("weights", {})
-            wg = weights.get("geometry",    0.35)
-            ws = weights.get("semantic",    0.20)
-            wu = weights.get("uncertainty", 0.25)
-            wd = weights.get("dynamic",     0.20)
+            # Carry the disagreement signal into the U term.
+            dis = getattr(frame, "_geom_sem_disagree", None)
+            if dis is not None and frame.tile_of_point is not None:
+                self._rollup_disagreement(frame)
 
-            res_cfg  = self.cfg.get("resolution", {})
-            thresh   = res_cfg.get("thresholds", {})
-            mode     = thresh.get("threshold_mode", "percentile")
-
-            conf_fb = self.cfg.get("semantics", {}).get(
-                "confidence_fallback_threshold", 0.45)
-            mot_prob_thresh = self.cfg.get("thresholds", {}).get(
-                "motion", {}).get("probability", 0.55)
-
-            motion_changes = 0
-            unc_changes    = 0
-
-            for tile in frame.tiles:
-                prev_v = tile.info_value
-
-                # ── Refresh D from S5 motion ──────────────────────
-                if tile.motion_probability > tile.score_dynamic:
-                    tile.score_dynamic = tile.motion_probability
-                    motion_changes += 1
-
-                # ── Refresh U from S4 semantic uncertainty ─────────
-                # Low confidence → uncertainty is meaningfully high
-                if tile.semantic_confidence > 0 and tile.semantic_confidence < conf_fb:
-                    effective_unc = max(tile.score_uncertainty, tile.semantic_uncertainty)
-                    if effective_unc > tile.score_uncertainty:
-                        tile.score_uncertainty = effective_unc
-                        unc_changes += 1
-
-                # ── Safety re-check: motion → pin ─────────────────
-                if tile.motion_probability > mot_prob_thresh:
-                    if not tile.safety_pinned:
-                        tile.safety_pinned = True
-                        tile.safety_reason = (
-                            tile.safety_reason + ", dynamic"
-                            if tile.safety_reason else "dynamic object"
-                        )
-
-                # ── Recompute combined V ──────────────────────────
-                v = (wg * tile.score_geometry   +
-                     ws * tile.score_semantic    +
-                     wu * tile.score_uncertainty +
-                     wd * tile.score_dynamic)
-                tile.info_value = float(np.clip(v, 0.0, 1.0))
-
-            # ── Re-apply budget with refined scores ───────────────
-            budget  = ctx.budget
-            n_total = len(frame.tiles)
-            n_budget= max(1, int(n_total * budget))
-
-            priorities = [(t.priority(), i) for i, t in enumerate(frame.tiles)]
-            priorities.sort(reverse=True)
-            top_indices = set(i for _, i in priorities[:n_budget])
-
-            for i, tile in enumerate(frame.tiles):
-                tile.selected = (i in top_indices) or tile.safety_pinned
-
-            # ── Percentile thresholds within selected occupied ─────
-            sel_occ_V = np.array(
-                [t.info_value for t in frame.tiles
-                 if t.point_count > 0 and (t.selected or t.safety_pinned)],
-                dtype=np.float32,
+            # The budget is a fraction of what a uniform 5 cm map of THIS frame
+            # would cost, so the number on the slider means "this much of a
+            # uniform 5 cm map's memory".
+            cost_table = tile_cells_at_level(frame.morton, len(tiles))
+            ref_cells = int(cost_table[:, 0].sum())
+            levels = self.ctrl.allocate(
+                tiles,
+                budget=ctx.budget,
+                policy=ctx.allocation_policy,
+                vehicle_max_step=self.profile.max_step_m,
+                reference_cells=ref_cells,
+                cost_table=cost_table,
             )
-            if mode == "percentile" and len(sel_occ_V) >= 4:
-                hp     = thresh.get("high_percentile",   75)
-                mp     = thresh.get("medium_percentile", 40)
-                high_t = float(np.percentile(sel_occ_V, hp))
-                med_t  = float(np.percentile(sel_occ_V, mp))
-            else:
-                high_t = thresh.get("high",   0.45)
-                med_t  = thresh.get("medium", 0.22)
+            frame.tile_cost_table = cost_table
 
-            for i, tile in enumerate(frame.tiles):
-                if not tile.selected or tile.point_count == 0:
-                    tile.resolution_level = ResolutionLevel.LEVEL_4
-                    continue
+            # THE CONNECTION: per-tile level -> per-point level -> map cell size.
+            frame.point_level = levels_to_points(
+                tiles, levels, frame.tile_of_point, n)
+            frame.tile_levels = levels
 
-                v = tile.info_value
-                r = tile.range_mean
+            pinned = np.array([t.safety_pinned for t in tiles], bool)
+            frame.point_pinned = levels_to_points(
+                tiles, pinned.astype(np.int8), frame.tile_of_point, n).astype(bool) \
+                if len(tiles) else np.zeros(n, bool)
 
-                if tile.safety_pinned or v >= high_t:
-                    level = ResolutionLevel.LEVEL_0
-                elif v >= med_t:
-                    level = ResolutionLevel.LEVEL_1 if r < 20 else ResolutionLevel.LEVEL_2
-                else:
-                    level = ResolutionLevel.LEVEL_3
+            diag = dict(self.ctrl.last_diag)
+            diag["point_level_hist"] = np.bincount(
+                np.clip(frame.point_level, 0, 4), minlength=5).tolist()
+            frame.timing["S6_diag"] = diag
 
-                tile.resolution_level = level
+    @staticmethod
+    def _uniform5_cells(frame: Frame) -> int:
+        """Level-0 cells this frame's points occupy — the budget's unit."""
+        from adaptive_lidar.utils.grouping import morton_2d
+        p = frame.points
+        if len(p) == 0:
+            return 1
+        ix = np.floor(p[:, 0] / 0.05).astype(np.int64)
+        iy = np.floor(p[:, 1] / 0.05).astype(np.int64)
+        return max(int(len(np.unique(morton_2d(ix, iy)))), 1)
 
-            # Record feedback loop telemetry
-            frame.timing["S6_feedback"] = {
-                "motion_changes": motion_changes,
-                "uncertainty_changes": unc_changes,
-                "n_dynamic_tiles": sum(1 for t in frame.tiles if t.score_dynamic > 0.1),
-                "threshold_high": high_t if len(sel_occ_V) >= 4 else thresh.get("high", 0.45),
-                "threshold_med":  med_t  if len(sel_occ_V) >= 4 else thresh.get("medium", 0.22),
-            }
+    @staticmethod
+    def _rollup_disagreement(frame: Frame):
+        from adaptive_lidar.utils.grouping import segment_reduce
+        mi = getattr(frame, "morton", None)
+        if mi is None or mi.n_tiles == 0:
+            return
+        d = frame._geom_sem_disagree[mi.order].astype(np.float32)
+        frac = segment_reduce(d, mi.tile_starts, "mean")
+        for j in range(mi.n_tiles):
+            t = frame.tiles[j]
+            # A tile where a third of the points disagree is genuinely
+            # ambiguous; one stray point is not.
+            if frac[j] > 0.3:
+                t.max_entropy = min(1.0, t.max_entropy + 0.25)

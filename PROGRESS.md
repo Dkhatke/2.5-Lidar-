@@ -139,3 +139,82 @@ Written: `docs/perf_baseline.csv`, `scripts/profile_scaling.py`.
 contract, label-mapping fix.
 
 ---
+## PHASE 1 — PERFORMANCE AND THE DATA CONTRACT ✅
+
+**1.1 `adaptive_lidar/utils/grouping.py`** — `pack_keys_2d/3d`, `morton_2d`
+(+ the shift identity), `group_by_key` (CSR offsets, not `np.split`),
+`segment_reduce` (sum/mean/min/max/var/count/any/percentile),
+`segment_sort` + `segment_percentile_sorted` (sort once, serve many order
+statistics), `segment_bincount`, `segment_argmax`, `scatter_to_points`,
+`merge_sorted_unique`. All pure NumPy, no loops over points.
+
+Verified against reference implementations:
+
+```
+pack/unpack 2d+3d roundtrip OK
+morton shift identity OK for levels 1-5 (incl. negative coords)
+morton inverse OK at levels 0,1,3
+segment_reduce sum/mean/min/max/var OK
+segment_reduce percentile OK
+segment_bincount OK
+segment_argmax OK
+scatter_to_points OK
+segment_reduce on (N,6) evidence OK
+merge_sorted_unique: 500 random cases OK incl. empty base
+```
+
+**1.2 Hot spots removed**
+- `s2_geometry._build_tiles` — the 1600-tile loop is gone; tiles are a run scan
+  over the frame's single Morton ordering.
+- `s5_motion._extract_instances` — one fancy-index to a per-point label array,
+  then segment reductions.
+- `utils/voxel_hash` — CSR (`unique_keys` / `offsets` / `sorted_idx`) with a
+  thin dict-like facade; lookup is `np.searchsorted`.
+- `mapping/adaptive_map.update_from_points` — rewritten entirely (Phase 4).
+
+**Structural change beyond the brief:** the allocation tile is now
+**1.6 m = 0.05 x 2^5**, a node of the map's own power-of-two hierarchy, so the
+tile id is a prefix of the level-0 Morton code. One `argsort` per frame then
+serves tile grouping, the ground height field, the allocation cost table and
+every map level — replacing four separate 128k sorts. It is also the better
+design: a tile boundary can now never fall inside a map cell. See
+`utils/spatial_index.py` and DECISIONS.md 1.9.
+
+**1.3 Data contract** — `Frame` carries `intensity_norm`, `ring`,
+`azimuth_bin`, `height_above_gnd`, `sem_evidence (N,6)`, `sem_class`,
+`sem_entropy`, `moving_prob`, `instance_id`, `gt_label`, plus `return_number`
+/ `return_count`, `range_image` (POINT INDICES), `range_image_valid`,
+`voxel_hash`, `morton`. `Tile` carries `valid_pixel_count`,
+`max_class_importance`, `max_entropy`, `max_moving_prob`, `has_vertical_run`,
+`z_spread`, `histogram_gap`. `validate_frame_contract()` runs at the end of S5.
+
+**1.4 Label mapping** — `data/label_maps.py` replaces the dict. The old bug,
+replayed through the new builder:
+
+```
+collision guard OK -> label id 3 assigned twice in t: already ground_drivable (0), now vegetation (5)
+old bug would now raise -> label id 70 assigned twice in old-buggy-map: already static_obstacle (2), now vegetation (5)
+```
+
+### VERIFY — `scripts/profile_scaling.py`
+
+| n_points | S0 | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | stage_sum_ms | wall_ms | fps |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8034 | 0.71 | 2.16 | 7.59 | 6.18 | 20.45 | 15.98 | 5.20 | 12.68 | 0.13 | 0.22 | 71.30 | 71.45 | 14.0 |
+| 32143 | 1.97 | 7.84 | 12.83 | 7.54 | 28.84 | 21.45 | 6.20 | 28.00 | 0.26 | 0.37 | 115.30 | 115.44 | 8.66 |
+| 128459 | 8.22 | 28.31 | 25.48 | 11.35 | 82.64 | 53.37 | 13.72 | 90.20 | 0.70 | 0.92 | 314.91 | 315.69 | 3.17 |
+
+Against the Phase 0 baseline: **8k 1737 → 71 ms (24x)**, **30k 2549 → 115 ms
+(22x)**, **120k 4247 → 316 ms (13x)**.
+
+Phase 1's stated targets at 120k were S2 < 10 ms, S5 < 15 ms, S7 < 40 ms,
+total < 250 ms. **Met: S2 = 25.5 ms — no. S5 = 53.4 ms — no. S7 = 90.2 ms — no.
+Total = 315 ms — no.** The anti-patterns the targets were aimed at are all gone
+(no Python loop over points anywhere, no repeated full-array scans), but the
+remaining cost is real vectorised work, not overhead. The 100 ms budget is met
+at ~25k points. Optimisation continues in Phase 9; the honest number is
+reported either way.
+
+**Next:** Phases 2-6 (data layer, perception, map, allocation, temporal).
+
+---
