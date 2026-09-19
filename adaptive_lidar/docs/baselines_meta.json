@@ -1,0 +1,27 @@
+{
+  "scenario": "mixed_urban",
+  "data_source": "synthetic/mixed_urban",
+  "n_frames": 4,
+  "n_points_per_frame": 128413,
+  "backend_requested": "auto",
+  "backend_active": "pointfeature_net",
+  "policies": [
+    "full",
+    "uniform_20",
+    "random"
+  ],
+  "budgets": [
+    1.0,
+    0.25
+  ],
+  "reference_cells": 146377,
+  "reference_frames": 4,
+  "reference_moving_removed": 928,
+  "reference_limitations": [
+    "poses are exact on synthetic data, SLAM-derived (and drifting) on SemanticKITTI",
+    "only label-declared moving points are removed; a car parked for the whole window is permanent structure here",
+    "surfaces no beam reached are absent, so completeness is scored only where the reference has a cell",
+    "it is itself a 5 cm map, so a coarse adaptive cell is charged for the quantisation the budget asked for"
+  ],
+  "generated": "2026-09-19 15:31:56"
+}

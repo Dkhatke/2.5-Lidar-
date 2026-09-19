@@ -43,25 +43,50 @@ _LOG_NC = float(np.log(NUM_CLASSES))
 #: evaluation reports both.
 GROUND_RULE_CLASSES = (0, 1)
 
+#: Corrected-intensity boundary between drivable and rough ground, and the
+#: softness of the transition. Both read off the measured distributions rather
+#: than chosen: see classify_ground_points.
+GROUND_INTENSITY_BOUNDARY = 0.20
+GROUND_INTENSITY_WIDTH = 0.06
+
 
 def classify_ground_points(feats: np.ndarray) -> np.ndarray:
     """(K, 6) evidence for points already known to be ground.
 
-    Drivable road is smooth, planar and low-reflectance; rough ground (grass,
-    verge, mud) is none of those.  Returns real evidence, not a hard label, so
-    the entropy of a marginal case still reaches the allocation controller.
+    The discriminator is CORRECTED intensity, and it is nearly clean.
+    Measured on the synthetic scan (median, interquartile range):
+
+        drivable (asphalt)  0.152   [0.135, 0.169]
+        rough (grass/verge) 0.361   [0.217, 0.446]
+
+    which is the material reflectance the LiDAR equation predicts — 0.15 for
+    asphalt against 0.45 for vegetation in the near infrared — recovered by
+    the range and incidence correction in `features.normalise_intensity`.
+    Without that correction the same two surfaces are indistinguishable,
+    because a bright surface at 60 m returns less than a dark one at 5 m.
+    This rule is the clearest evidence that the correction earns its cost.
+
+    Geometric roughness is kept as secondary evidence rather than primary: on
+    a real verge it helps, but on smooth grass it says nothing, and an earlier
+    version of this rule that leaned on it (with an intensity threshold set by
+    intuition at 0.6 rather than measured at 0.20) classified 97% of all
+    ground as drivable.
+
+    Returns evidence rather than a hard label, so the entropy of a marginal
+    case still reaches the allocation controller.
     """
     if len(feats) == 0:
         return np.zeros((0, NUM_CLASSES), np.float32)
-    zvar = feats[:, 3]
     inorm = feats[:, 2]
+    zvar = feats[:, 3]
     planar = feats[:, 10]
+
+    # Logistic in corrected intensity about the measured boundary.
+    t = (inorm - GROUND_INTENSITY_BOUNDARY) / GROUND_INTENSITY_WIDTH
     s = np.zeros((len(feats), NUM_CLASSES), np.float32)
-    s[:, 0] = 2.0 + 1.5 * planar - 5.0 * np.clip(zvar / 0.05, 0, 3) \
-        - 1.2 * np.clip(inorm - 0.6, 0, 2)
-    s[:, 1] = 1.6 + 3.0 * np.clip(zvar / 0.05, 0, 2) \
-        + 1.0 * np.clip(inorm - 0.4, 0, 2) - 1.0 * planar
-    s[:, 2:] = -3.0
+    s[:, 0] = -2.6 * t + 0.7 * planar - 4.0 * np.clip(zvar * 20.0, 0, 3)
+    s[:, 1] = 2.6 * t - 0.7 * planar + 4.0 * np.clip(zvar * 20.0, 0, 3)
+    s[:, 2:] = -6.0
     s -= s.max(axis=1, keepdims=True)
     ev = np.exp(s, dtype=np.float32)
     return ev / np.maximum(ev.sum(axis=1, keepdims=True), _EPS)
@@ -117,43 +142,53 @@ class GeometryRulesBackend:
         planar = f[:, 10]
         vert = f[:, 11]
 
+        inc = f[:, 7]
         s = np.zeros((n, NUM_CLASSES), np.float32)
 
-        # Precompute the shared clipped terms once: each of these appeared in
-        # three or four class scores and was being recomputed every time,
-        # allocating a fresh 128k array each go.
+        # Coefficients calibrated against MEASURED per-class feature medians
+        # on the synthetic scan, not chosen by intuition. The medians that
+        # matter (ground / static / vehicle / vru / vegetation):
+        #
+        #   height_above_ground   0.0  1.08  0.86  1.02  1.96
+        #   intensity_norm       0.15  0.29  0.53  0.37  0.53
+        #   vertical_run          1.0  23.0  12.0  19.0   1.0
+        #   incidence_cos        0.28  0.76  0.36  0.57  0.56
+        #   voxel_neighbours      104    38    27    86     5
+        #   penetration_ratio     0.0   0.0   0.0   0.0   0.5
+        #
+        # An earlier version assumed a pedestrian is geometrically SPARSE and
+        # has a SHORT ring run. The data says the opposite for anything but
+        # the far field, and the rules scored 0.02 IoU on the class they were
+        # written to protect. These are the same features read the right way
+        # round; the three object classes remain genuinely hard to separate
+        # geometrically, which is the honest reason the network exists.
         near_ground = (hag < 0.25).astype(np.float32)
-        zv2 = np.clip(zvar * 20.0, 0.0, 2.0)          # zvar / 0.05, capped
-        zv3 = np.clip(zvar * 20.0, 0.0, 3.0)
-        zv8 = np.clip(zvar * 12.5, 0.0, 2.0)          # zvar / 0.08
-        i_hi = np.clip(inorm - 0.6, 0.0, 2.0)
-        i_md = np.clip(inorm - 0.45, 0.0, 2.0)
-        i_lo = np.clip(inorm - 0.4, 0.0, 2.0)
-        run8 = np.clip(run * 0.125, 0.0, 2.0)
-        run5 = np.clip(run * 0.2, 0.0, 1.5)
-        run12 = np.clip(run * (1.0 / 12.0), 0.0, 2.0)
-        nbr14 = np.clip(nbr * (1.0 / 14.0), 0.0, 2.0)
-        nbr_sparse = np.clip((10.0 - nbr) * 0.125, 0.0, 1.5)
-        tall = (hag > 0.5).astype(np.float32)
-        mid = ((hag > 0.3) & (hag < 2.2)).astype(np.float32)
-        human = ((hag > 0.4) & (hag < 2.1)).astype(np.float32)
-        bushy = (hag > 0.6).astype(np.float32)
+        zv = np.clip(zvar * 20.0, 0.0, 3.0)
+        t_int = (inorm - GROUND_INTENSITY_BOUNDARY) / GROUND_INTENSITY_WIDTH
+        run_n = np.clip(run / 24.0, 0.0, 1.0)
+        nbr_n = np.clip(nbr / 80.0, 0.0, 1.5)
+        tall = (hag > 0.45).astype(np.float32)
 
-        # 0 ground_drivable - flat, smooth, planar, low reflectance
-        s[:, 0] = 2.4 * near_ground + 1.6 * planar - 6.0 * zv3 - 1.2 * i_hi
-        # 1 ground_rough - near ground but not smooth
-        s[:, 1] = 2.0 * near_ground + 3.0 * zv2 + 1.0 * i_lo - 1.0 * planar
-        # 2 static_obstacle - tall, vertical, long ring run, solid
-        s[:, 2] = 2.2 * tall + 2.0 * vert + 1.4 * run8 + 1.2 * planar - 3.0 * pen
-        # 3 vehicle - 0.3-2.2 m, wide (dense voxel), planar panels, solid
-        s[:, 3] = 2.6 * mid + 1.6 * nbr14 + 1.0 * planar - 2.5 * pen - 1.5 * run12
-        # 4 vru - human height, narrow, short vertical run, not planar.
-        #   Deliberately generous: a false VRU costs budget, a missed one costs
-        #   a person.
-        s[:, 4] = (3.0 * human + 1.8 * nbr_sparse + 1.4 * run5
-                   - 1.6 * planar - 2.0 * pen)
-        # 5 vegetation - multi-return, high NIR intensity, rough, non-planar
-        s[:, 5] = 3.2 * pen + 1.8 * i_md + 1.6 * zv8 + 1.2 * bushy - 2.0 * planar
+        # 0/1 ground: the same corrected-intensity boundary as above.
+        s[:, 0] = 3.0 * near_ground - 2.2 * t_int + 0.6 * planar - 3.0 * zv
+        s[:, 1] = 3.0 * near_ground + 2.2 * t_int - 0.6 * planar + 3.0 * zv
+
+        # 5 vegetation: multi-return is almost a sufficient statistic.
+        s[:, 5] = (5.0 * pen + 1.2 * (hag > 1.2) + 1.0 * zv
+                   - 1.5 * planar - 1.2 * run_n)
+
+        # 2 static_obstacle: the longest ring runs, the flattest faces, seen
+        #    closest to head-on.
+        s[:, 2] = (2.0 * tall + 1.6 * vert + 2.0 * run_n
+                   + 1.4 * planar + 1.2 * inc - 4.0 * pen)
+
+        # 3 vehicle: bright metal, oblique panels, shorter runs than a wall.
+        s[:, 3] = (2.0 * tall + 1.4 * vert + 1.3 * np.clip(t_int, 0, 6) / 6.0 * 3.0
+                   - 1.6 * inc - 1.2 * run_n - 3.0 * pen)
+
+        # 4 vru: human height, dense at short range, mid-length runs, oblique.
+        s[:, 4] = (3.0 * ((hag > 0.5) & (hag < 2.1)).astype(np.float32)
+                   + 1.3 * nbr_n + 1.0 * run_n - 0.9 * inc - 3.0 * pen)
 
         s -= s.max(axis=1, keepdims=True)
         ev = np.exp(s, dtype=np.float32)

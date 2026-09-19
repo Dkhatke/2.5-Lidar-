@@ -1,17 +1,17 @@
 {
-  "temperature": 1.3340576887130737,
-  "ece_before": 0.009718036885052673,
-  "ece_after": 0.006399550791823567,
+  "temperature": 1.4592417478561401,
+  "ece_before": 0.012290745009400219,
+  "ece_after": 0.00804547614398773,
   "n_bins": 15,
-  "val_points": 256658,
-  "val_miou": 0.843315398557039,
+  "val_points": 385006,
+  "val_miou": 0.8712066927955164,
   "val_iou_per_class": {
-    "ground_drivable": 0.9225281403582941,
-    "ground_rough": 0.9388642004375252,
-    "static_obstacle": 0.9742658568655689,
-    "vehicle": 0.6532407407407408,
-    "vru": 0.625170998632011,
-    "vegetation": 0.945822454308094
+    "ground_drivable": 0.9304308478546333,
+    "ground_rough": 0.9480817375119605,
+    "static_obstacle": 0.9873450651628441,
+    "vehicle": 0.7818657367044464,
+    "vru": 0.5956598759964571,
+    "vegetation": 0.9838568935427574
   },
   "method": "single-parameter temperature scaling, LBFGS on held-out NLL",
   "note": "Raw softmax from a cross-entropy-trained network is systematically overconfident. The allocation controller's uncertainty term and the map's entropy layer both read this distribution, so it is calibrated before either sees it."
