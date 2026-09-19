@@ -27,9 +27,15 @@ resolution:
     LEVEL_3: 0.40
     LEVEL_4: 0.80          # coarsest — 80 cm
   thresholds:
-    high: 0.65             # score >= high → LEVEL_0
-    medium: 0.35           # score >= medium → LEVEL_1/2 depending on range
-    low: 0.0               # otherwise → LEVEL_3/4
+    # threshold_mode: "percentile" uses distribution-aware thresholds
+    # threshold_mode: "absolute"  uses absolute V score cutoffs
+    threshold_mode: "percentile"
+    high_percentile: 75      # top 25% of occupied tiles → LEVEL_0 (HIGH)
+    medium_percentile: 40    # top 60% of occupied tiles → LEVEL_1/2 (MEDIUM)
+    # Fallback absolute thresholds (used when threshold_mode=absolute):
+    high: 0.45
+    medium: 0.22
+    low: 0.0
 
 budget:
   default: 0.80            # fraction of compute budget (1.0 = full)
@@ -54,15 +60,16 @@ thresholds:
   safety:
     max_range_pin: 20.0    # tiles within this range with obstacle → pinned
     pedestrian_height_max: 2.2
-    pedestrian_height_min: 0.8
+    pedestrian_height_min: 0.5
     pedestrian_footprint_max: 1.5
+    pedestrian_min_points: 8
   ground:
     height_threshold: 0.3  # points within this of grid floor are ground
     grid_resolution: 1.0
 
 map:
-  resolution: 0.10         # default map cell size (m)
-  temporal_decay: 0.85     # weight of previous observation
+  resolution: 0.25         # default map cell size (m) — coarser is faster
+  temporal_decay: 0.80     # weight of previous observation (lower = faster update)
   unknown_flag: true
   log_odds_free: -0.3
   log_odds_occupied: 0.5
@@ -78,7 +85,48 @@ semantics:
     - vru
     - vegetation
   num_classes: 6
+  # Use geometry fallback as primary when neural backend confidence < threshold
+  confidence_fallback_threshold: 0.45
 
 pipeline:
   target_latency_ms: 40.0  # conceptual future target — NOT a claim
   max_frames_history: 5
+
+# ============================================================
+# Synthetic driving scene configuration
+# ============================================================
+synthetic:
+  seed: 42                 # reproducible scene generation
+  fps: 10                  # frames per second (for motion simulation)
+  road_length: 120.0       # metres forward
+  road_width: 7.0          # metres (two lanes)
+  building_offset: 6.0     # metres from road edge to buildings
+
+camera:
+  enabled: true
+  width: 640
+  height: 360
+  fov_deg: 90.0            # horizontal field of view
+  mount_height: 1.5        # metres above ground
+  near_clip: 1.0           # metres
+
+lidar_sim:
+  channels: 64
+  horizontal_points: 1024
+  max_range: 80.0
+  noise_std: 0.03          # range noise standard deviation (m)
+  dropout_prob: 0.005      # random beam dropout fraction
+  intensity_ground: 0.3
+  intensity_obstacle: 0.6
+  intensity_vehicle: 0.7
+
+# ============================================================
+# Evaluation configuration
+# ============================================================
+evaluation:
+  enabled: true
+  min_iou_threshold: 0.25  # minimum IoU to count as detected
+  comparison_modes:
+    - full
+    - adaptive
+    - low_budget
