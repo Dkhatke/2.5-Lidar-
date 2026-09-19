@@ -63,14 +63,17 @@ class S2Geometry:
             ri = getattr(frame, "_range_image", None)
             if ri is not None and n:
                 noise = isolated_return_mask(ri, frame.intensity)
-                frame.noise_mask = noise
-                if noise.any():
-                    gmask = gmask & ~noise
             else:
-                frame.noise_mask = np.zeros(n, bool)
+                noise = np.zeros(n, bool)
+            frame.noise_mask = noise
 
-            frame.ground_mask = gmask
-            frame.non_ground_mask = ~gmask
+            # A dust return is neither ground NOR an object: excluding it from
+            # BOTH masks is the point. Clearing it only from the ground mask
+            # promoted every speck to non-ground, which inflated the
+            # connected-component volume and tripled the cost of instance
+            # extraction while inventing instances out of rain.
+            frame.ground_mask = gmask & ~noise
+            frame.non_ground_mask = ~gmask & ~noise
             frame.ground_z = gz
             frame.height_above_gnd = hag
             frame.timing["S2_ground_method"] = self.ground.active

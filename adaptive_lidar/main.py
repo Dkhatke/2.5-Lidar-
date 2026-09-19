@@ -111,7 +111,7 @@ def summary(pipe, wall, n_frames):
           f"({t.get('uniform5_cells', 0):,} cells)")
     print(f"    reduction         : {t.get('memory_reduction_pct', 0):8.1f} %")
     print()
-    print("  PER-STAGE LATENCY  (M6)")
+    print("  PER-STAGE LATENCY  (M6)  — steady state, warm-up frame discarded")
     print(f"    {'stage':<8}{'p50':>9}{'p95':>9}{'p99':>9}")
     tot50 = 0.0
     for s in ("S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"):
@@ -160,8 +160,14 @@ def main():
     print("\nProcessing frames...\n")
 
     t0 = time.perf_counter()
-    for f in ds:
+    for k, f in enumerate(ds):
         frame = pipe.run(cloud_np=f, frame_id=f["frame_id"], timestamp=f["timestamp"])
+        if k == 0:
+            # Discard the first frame from the latency percentiles: it pays
+            # import, allocator and BLAS warm-up and has no previous frame for
+            # the motion residual, so it is not a steady-state measurement.
+            # Its map contribution is kept.
+            pipe.context.cumulative_timing.clear()
         frame_line(frame)
     wall = time.perf_counter() - t0
 

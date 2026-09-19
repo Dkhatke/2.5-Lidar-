@@ -1,47 +1,40 @@
 # ============================================================
-# SIH26 — Adaptive Foveated 2.5D LiDAR Perception
-# requirements.txt
+# Adaptive Variable-Resolution 2.5D LiDAR Mapping
+# SIH 2026 / DRDO PS 26053
 #
-# HOW TO INSTALL (first time)
-# ----------------------------
-#   python3 -m venv .venv
-#   source .venv/bin/activate          # Windows: .venv\Scripts\activate
+#   python -m venv .venv
+#   .venv\Scriptsctivate      (Windows)  |  source .venv/bin/activate
 #   pip install -r requirements.txt
 #
-# HOW TO RUN
-# ----------
-#   streamlit run app.py               # visual dashboard
-#   python main.py --demo              # CLI demo (synthetic scene)
-#   python main.py --synthetic         # explicit synthetic mode
-#   python -m pytest tests/            # run all unit tests
+#   python main.py --demo
+#   streamlit run app.py
+#   python -m pytest tests/
 #
-# OPTIONAL BACKENDS (install separately — do NOT block if missing)
-# ----------------------------------------------------------------
-#   MinkowskiEngine  →  see docs/INSTALL_MINKOWSKI.md
-#   open3d           →  pip install open3d  (for 3-D point-cloud viewer)
+# CPU ONLY. Nothing here needs a GPU, and nothing needs nvcc.
+# MinkowskiEngine, torchsparse, spconv and Open3D-ML's CUDA ops are
+# deliberately absent: they require CUDA to BUILD, not merely to run, so on
+# a CPU-only machine they can never be more than an ImportError path.
+# See DECISIONS.md 9.1.
 # ============================================================
 
-
 # ── Core numerics ──────────────────────────────────────────
-numpy>=1.24,<3.0          # Array math backbone — used everywhere
-scipy>=1.10               # KD-tree, connected components, signal processing
-pandas>=2.0               # Telemetry tables, timing stats, CSV export
+numpy>=1.24,<3.0          # every array path
+scipy>=1.10               # connected components, Hungarian assignment
+pandas>=2.0               # dashboard tables, CSV export
 
-# ── Machine learning ───────────────────────────────────────
-torch>=2.0                # PyTorch — PrototypeSparseBackend lives here
-                          # CPU-only is fine; CUDA picked up automatically
-scikit-learn>=1.2         # Connected components, nearest-neighbour for S5
+# ── Machine learning (CPU wheel) ───────────────────────────
+# Install the CPU build explicitly if pip resolves to a CUDA one:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0                # PointFeatureNet: 11,406 parameters, CPU inference
 
-# ── Visualisation & Dashboard ──────────────────────────────
-streamlit>=1.28           # Main dashboard (app.py)
-plotly>=5.14              # All interactive plots inside Streamlit
+# ── Dashboard and figures ──────────────────────────────────
+streamlit>=1.30           # the dashboard
+matplotlib>=3.7           # docs/*.png
+pillow>=10.0              # image I/O for the rendered map
 
-# ── Config & utilities ─────────────────────────────────────
-pyyaml>=6.0               # Reads config.yaml — all constants live there
+# ── Config and testing ─────────────────────────────────────
+pyyaml>=6.0               # config.yaml
+pytest>=7.0               # 63 tests
 
-# ── Optional (install for richer 3-D visualisation) ────────
-# open3d>=0.17            # Uncomment if you want the Open3D 3-D viewer tab
-#                         # May be slow to install on some platforms
-
-# ── Development / testing ──────────────────────────────────
-pytest>=7.0               # Unit tests (tests/ directory)
+# ── Optional, tried at import and never required ───────────
+# pypatchworkpp           # ground segmentation; ring-geometry is the fallback

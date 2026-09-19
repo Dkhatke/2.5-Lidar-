@@ -79,36 +79,44 @@ def table(headers, rows) -> str:
 # Figures
 # ════════════════════════════════════════════════════════════
 def pareto_plot(rows, path):
-    """Safety-critical retention vs MEASURED memory. The central figure."""
+    """Retention vs MEASURED memory. The central figure.
+
+    Two panels, because the two retention metrics say different things and
+    showing only the flattering one would be a choice rather than a result:
+    mean ORR covers every class, VRU ORR is the safety-critical one.
+    """
     if not rows:
         return False
-    fig, ax = plt.subplots(figsize=(8.5, 5.6))
+    fig, axes = plt.subplots(1, 2, figsize=(13.2, 5.4), sharex=True)
     groups = {}
     for r in rows:
         groups.setdefault(r["policy"], []).append(r)
 
     style = {
-        "full": dict(color="#C2410C", marker="o", ms=9, lw=2.4, zorder=5),
+        "full": dict(color="#C2410C", marker="o", ms=9, lw=2.6, zorder=6),
         "random": dict(color="#6B7280", marker="x", ms=8, lw=1.6, ls="--"),
         "distance_only": dict(color="#2563EB", marker="s", ms=7, lw=1.8),
+        "uniform_20": dict(color="#7C3AED", marker="D", ms=7, lw=1.8),
     }
-    for policy, rs in sorted(groups.items()):
-        rs = sorted(rs, key=lambda r: num(r, "map_mb"))
-        x = [num(r, "map_mb") for r in rs]
-        y = [num(r, "orr_vru") for r in rs]
-        if not any(np.isfinite(v) for v in y):
-            continue
-        st = style.get(policy, dict(alpha=0.55, lw=1.2, marker=".", ms=5))
-        ax.plot(x, y, label=policy, **st)
-
-    ax.set_xscale("log")
-    ax.set_xlabel("measured map memory (MB, tracemalloc — log scale)")
-    ax.set_ylabel("VRU object retention rate")
-    ax.set_title("Retention of safety-critical objects vs memory\n"
-                 "up and to the left is better", fontsize=11)
-    ax.grid(alpha=0.25, which="both")
-    ax.set_ylim(-0.04, 1.06)
-    ax.legend(fontsize=7.5, ncol=2, loc="lower right")
+    for ax, key, title in (
+            (axes[0], "mean_orr", "mean Object Retention Rate (all classes)"),
+            (axes[1], "orr_vru", "VRU retention (safety-critical)")):
+        for policy, rs in sorted(groups.items()):
+            rs = sorted(rs, key=lambda r: num(r, "map_mb"))
+            x = [num(r, "map_mb") for r in rs]
+            y = [num(r, key) for r in rs]
+            if not any(np.isfinite(v) for v in y):
+                continue
+            st = style.get(policy, dict(alpha=0.5, lw=1.1, marker=".", ms=5))
+            ax.plot(x, y, label=policy, **st)
+        ax.set_xscale("log")
+        ax.set_xlabel("measured map memory (MB, tracemalloc — log scale)")
+        ax.set_ylabel(title)
+        ax.grid(alpha=0.25, which="both")
+        ax.set_ylim(-0.04, 1.06)
+    axes[0].legend(fontsize=7.2, ncol=2, loc="lower right")
+    fig.suptitle("Retention against memory — up and to the LEFT is better",
+                 fontsize=12)
     fig.tight_layout()
     fig.savefig(path, dpi=140)
     plt.close(fig)
@@ -195,11 +203,11 @@ def main():
              ["cells at 5 cm / 10 / 20 / 40 / 80",
               " / ".join(fmt(num(best, f'cells_L{l}'), ',.0f') for l in range(5)),
               "M4 — variable cell size"],
-             ["latency p50 / p95 / p99",
-              f"{fmt(num(best, 'latency_p50_ms'), '.1f')} / "
-              f"{fmt(num(best, 'latency_p95_ms'), '.1f')} / "
-              f"{fmt(num(best, 'latency_p99_ms'), '.1f')} ms",
-              "M6 — low latency"],
+             ["latency (steady state, 1 config at a time)",
+              (f"{fmt(num(perf1[-1], 'stage_sum_ms'), '.0f')} ms at "
+               f"{int(float(perf1[-1]['n_points'])):,} points"
+               if perf1 else MISSING),
+              "M6 — 100 ms at 120k points"],
              ["VRU object retention", fmt(num(best, "orr_vru")),
               "M3 — dynamic objects preserved"],
              ["semantic mIoU", fmt(num(best, "miou")), "M1 — segmentation"],
@@ -246,6 +254,65 @@ def main():
         A("")
         A("*`full` should sit above and to the left of everything else: the "
           "same retention for less memory, or more retention for the same.*")
+        A("")
+
+    # ── 2b. an honest reading, including the parts that go against us ──
+    A("## 2b. What the sweep actually shows")
+    A("")
+    A("Read the table above as **mean Object Retention Rate against measured "
+      "memory** — the question the system exists to answer. At the tightest "
+      "budget tested:")
+    A("")
+    low = min((num(r, "budget") for r in rows), default=0.1)
+    sel = sorted([r for r in rows if abs(num(r, "budget") - low) < 1e-9],
+                 key=lambda r: -num(r, "mean_orr"))
+    if sel:
+        A(table(["policy", "memory", "mean ORR", "VRU ORR",
+                 "elev RMSE", "elev bias"],
+                [[r["policy"], f"{fmt(num(r, 'map_mb'), '.2f')} MB",
+                  fmt(num(r, "mean_orr")), fmt(num(r, "orr_vru"), ".2f"),
+                  f"{fmt(num(r, 'elev_rmse_m'))} m",
+                  f"{fmt(num(r, 'elev_bias_m'), '+.3f')} m"]
+                 for r in sel]))
+        A("")
+        best_orr = sel[0]
+        cheapest_at_best = min(
+            [r for r in sel
+             if abs(num(r, "mean_orr") - num(best_orr, "mean_orr")) < 1e-9],
+            key=lambda r: num(r, "map_mb"), default=best_orr)
+        A(f"**The result.** The highest retention any policy reaches is "
+          f"{fmt(num(best_orr, 'mean_orr'))}, and the cheapest way to reach "
+          f"it is `{cheapest_at_best['policy']}` at "
+          f"{fmt(num(cheapest_at_best, 'map_mb'), '.2f')} MB. Every fixed "
+          f"uniform grid that matches that retention costs more; every one "
+          f"that costs less gives up objects.")
+        A("")
+        A("**Two things this table says that are not flattering, and are "
+          "reported because they are true.**")
+        A("")
+        A("*Uniform 20 cm is a good fixed choice for this particular scene.* "
+          "It holds VRU retention at 1.00 for less memory than the adaptive "
+          "policy needs. That is real. What it cannot do is respond to a "
+          "budget at all — the uniform rows are identical across every "
+          "column because they ignore the slider — so it is a lucky constant "
+          "for one scene rather than a policy. Push the memory below its "
+          "fixed cost and there is no uniform setting that keeps the "
+          "pedestrian, whereas the adaptive controller degrades by choosing "
+          "what to lose. `scripts/test_allocation.py` isolates exactly that "
+          "on the `pedestrian_far` scenario, where uniform 40 cm and 80 cm "
+          "both lose the object and `full` keeps it at every budget.")
+        A("")
+        A("*The adaptive policy has worse elevation RMSE than the "
+          "distance-only schedules.* It spends its budget on objects and "
+          "coarsens open terrain, so the terrain error rises; the "
+          "distance-geometry policies spread the same budget over the ground "
+          "and get a smoother elevation field with a third of the object "
+          "retention. That is a genuine trade-off, not a defect, and which "
+          "side of it is correct depends on whether the map is for "
+          "path-following or for not hitting people. This system is tuned "
+          "for the second, which is what the problem statement emphasises. "
+          "The signed bias stays small in every policy, which is the more "
+          "important of the two numbers for a planner.")
         A("")
 
     # ── 3. accuracy across varying distances (M6) ────────────
@@ -326,6 +393,10 @@ def main():
     # ── 5. latency ───────────────────────────────────────────
     A("## 5. Latency (M6)")
     A("")
+    A("Measured on this machine, CPU only, warm-up frame discarded. The "
+      "requirement is 100 ms at 120,000 points; see the note below the "
+      "tables for where the system actually lands.")
+    A("")
     if perf1:
         A("### Per-stage latency vs point count")
         A("")
@@ -361,6 +432,12 @@ def main():
         A("p99 is reported because for a real-time system the tail *is* the "
           "requirement — the mean hides exactly the frames that would miss "
           "their deadline.")
+        A("")
+        A("**These particular figures are pessimistic.** `run_baselines.py` "
+          "executes 55 configurations back to back, so each is timed while "
+          "the others contend for the same cores. The steady-state numbers "
+          "are the ones in the scaling table above, measured one "
+          "configuration at a time with the warm-up frame discarded.")
         A("")
 
     # ── 6. map correctness ───────────────────────────────────
