@@ -187,6 +187,15 @@ class AdaptiveMap:
         self.clearance_height = float(m.get("vehicle_clearance_height", 2.5))
         self.multi_surface_gap = float(m.get("multi_surface_gap", 0.5))
         self.carve_min_level = int(m.get("carve_min_level", 3))
+        # A cell must be confirmed by SEVERAL observations before free-space
+        # carving is forbidden from retracting it. Protecting anything already
+        # above the occupied threshold made a single obstacle observation
+        # permanent, so the cells a passing car wrote became carve-proof the
+        # instant it wrote them - which is exactly the phantom the gate exists
+        # to prevent. A wall seen from twenty frames clears this bar easily; a
+        # car seen from two does not.
+        self.carve_protect = float(
+            m.get("carve_protect_logodds", 2.0 * self.log_odds_occ))
         self.window_m = float(m.get("window_size", 200.0))
 
         self.frame_index = 0
@@ -588,11 +597,44 @@ class AdaptiveMap:
         # Only decrement cells that are not already strongly occupied — a beam
         # that grazes a wall must not carve the wall away.
         lo = cells["occupancy_logodds"][rows].astype(np.float32) * 0.1
-        lo = np.where(lo < self.occ_thresh, lo + self.log_odds_free, lo)
+        protect = lo >= self.carve_protect
+        lo = np.where(protect, lo, lo + self.log_odds_free)
         cells["occupancy_logodds"][rows] = np.clip(
             np.round(np.clip(lo, self.lo_min, self.lo_max) * 10.0), -128, 127
         ).astype(np.int8)
+
+        # Free space established at 40 cm invalidates whatever finer cells sit
+        # inside it.  Without this, carving can never undo an obstacle written
+        # by a moving object: the car's points land in 5 cm cells, the beams
+        # that later pass through its empty parking space are carved at 40 cm,
+        # and the two never meet — so the phantom survives every observation
+        # that disproves it.  The containment is the Morton prefix again, so
+        # propagating the verdict downward is one searchsorted per level.
+        freed = codes[(lo <= self.free_thresh) & ~protect]
+        if len(freed):
+            self._invalidate_finer(freed, level)
         return len(codes)
+
+    def _invalidate_finer(self, freed_codes: np.ndarray, level: int):
+        """Clear obstacle evidence in cells contained by a freed coarse cell."""
+        for fl in range(0, level):
+            st = self.levels[fl]
+            if len(st) == 0:
+                continue
+            shift = 2 * (level - fl)
+            parents = st.keys >> shift
+            hit = np.isin(parents, freed_codes)
+            if not hit.any():
+                continue
+            c = st.cells
+            # The surface is gone, not the terrain: ground_z is what we knew
+            # about the floor and remains true, while z_max, the obstacle, has
+            # been observed through.
+            c["z_max"][hit] = c["ground_z"][hit]
+            c["n_points"][hit] = 0
+            c["occupancy_logodds"][hit] = np.int8(
+                round(self.free_thresh * 10.0))
+            c["flags"][hit] = (c["flags"][hit] | CellFlags.STALE).astype(np.uint8)
 
     # ════════════════════════════════════════════════════════
     # Maintenance

@@ -39,6 +39,9 @@ import numpy as np
 from adaptive_lidar.pipeline.timing import stage_timer
 from adaptive_lidar.pipeline.types import Frame, PipelineContext, TrackState
 
+#: Classes an object can plausibly belong to and still drive away.
+MOVABLE_CLASSES = (3, 4)
+
 
 class DynamicOverlay:
     """Moving objects, rebuilt from scratch every frame.
@@ -74,6 +77,8 @@ class S8Fusion:
         self.gate_thresh = float(m.get("gate_threshold", 0.5))
         self.enabled = bool(m.get("gate_enabled", True))
         self.decay_every = int(config.get("map", {}).get("decay_every_frames", 10))
+        self.confirm_obs = int(
+            config.get("tracking", {}).get("confirm_observations", 2)) + 1
         self.overlay = DynamicOverlay()
         if ctx is not None:
             ctx.dynamic_overlay = self.overlay
@@ -133,6 +138,24 @@ class S8Fusion:
                 dtype=np.int64)
             if moving_ids.size:
                 moving |= np.isin(frame.instance_id, moving_ids)
+
+            # Motion cannot be detected without history, so on an object's
+            # first one or two frames the residual is silent and a genuinely
+            # moving car writes itself into the permanent map before anything
+            # can stop it - the first two frames of a 20-frame run accounted
+            # for most of the trail that survived the gate.
+            #
+            # The fix is the third track state doing its job: a movable-class
+            # object is held OUT of the persistent map until the tracker has
+            # seen it long enough to say it is standing still. A parked car
+            # enters the map 0.2 s late, which costs nothing; a moving car
+            # never enters it at all.
+            unconfirmed = np.array(
+                [i.instance_id for i in instances
+                 if i.semantic_class in MOVABLE_CLASSES
+                 and i.n_obs < self.confirm_obs], dtype=np.int64)
+            if unconfirmed.size:
+                moving |= np.isin(frame.instance_id, unconfirmed)
 
         # A point on the ground under a moving car is ground, not car.
         if frame.height_above_gnd is not None:

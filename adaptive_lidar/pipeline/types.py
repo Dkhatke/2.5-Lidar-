@@ -306,12 +306,19 @@ class TrackState:
 
 @dataclass
 class Instance:
+    # TWO ids, deliberately distinct. `cluster_id` is this frame's connected
+    # component and is what `Frame.instance_id` holds per point; `instance_id`
+    # is the TRACK id, which persists across frames. Conflating them silently
+    # breaks every per-point lookup that goes through a track — the MOS gate
+    # was testing cluster labels for membership in a set of track ids, which
+    # matched essentially at random.
     instance_id: int
     centroid: np.ndarray            # (3,)
     bbox_min: np.ndarray            # (3,)
     bbox_max: np.ndarray            # (3,)
     point_count: int
     semantic_class: int
+    cluster_id: int = -1                    # this frame's component label
     velocity: Optional[np.ndarray] = None   # (3,) m/s — lives HERE, never in cells
     covariance: Optional[np.ndarray] = None # (6,6) Kalman state covariance
     motion_probability: float = 0.0

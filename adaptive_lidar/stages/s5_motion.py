@@ -151,6 +151,7 @@ class S5Motion:
         for j in range(len(uniq)):
             out.append(Instance(
                 instance_id=int(uniq[j]),
+                cluster_id=int(uniq[j]),
                 centroid=cent[j].astype(np.float32),
                 bbox_min=cmin[j].astype(np.float32),
                 bbox_max=cmax[j].astype(np.float32),
@@ -181,6 +182,19 @@ class S5Motion:
             # 3. tracking — Hungarian + constant-velocity Kalman
             instances = self.tracker.update(instances, frame.timestamp, frame.pose)
             frame.instances = instances
+
+            # Re-key the per-point ids from cluster labels to TRACK ids, so
+            # that anything downstream holding a track id (the MOS gate, the
+            # dynamic overlay, the cell handle) can look points up directly.
+            if instances:
+                lut = np.full(int(inst.max()) + 2, -1, np.int32)
+                for i in instances:
+                    if i.cluster_id >= 0:
+                        lut[i.cluster_id] = i.instance_id
+                has = inst >= 0
+                inst = np.where(has, lut[np.clip(inst, 0, None)], -1)
+                frame.instance_id = inst
+                frame.instance_ids = inst
 
             # Push the track-level motion decision back onto the points, so the
             # MOS gate in S8 acts on whole objects rather than on noisy

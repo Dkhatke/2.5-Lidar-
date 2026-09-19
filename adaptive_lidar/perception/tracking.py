@@ -161,6 +161,7 @@ class Tracker:
             tid = assigned[di]
             trk = self._tracks[tid]
             trk.state = self._state_of(trk)
+            det.cluster_id = det.cluster_id if det.cluster_id >= 0 else det.instance_id
             det.instance_id = tid
             # Report velocity in the sensor frame for the current frame's use.
             det.velocity = (inv_R @ trk.vel).astype(np.float32)

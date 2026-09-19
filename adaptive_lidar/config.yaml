@@ -123,6 +123,9 @@ map:
   log_odds_max: 5.0
   occupied_logodds: 0.5
   free_logodds: -0.5
+  # Carving may not retract a cell above this; 2x log_odds_occupied means a
+  # cell needs at least two independent obstacle observations to be permanent.
+  carve_protect_logodds: 1.7
 
 semantics:
   classes:
