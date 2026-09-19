@@ -3,7 +3,7 @@
 # SIH 2026 / DRDO PS 26053
 #
 #   python -m venv .venv
-#   .venv\Scriptsctivate      (Windows)  |  source .venv/bin/activate
+#   .venv/Scripts/activate   (Windows)  |  source .venv/bin/activate
 #   pip install -r requirements.txt
 #
 #   python main.py --demo
