@@ -77,9 +77,11 @@ UI.inject_css()
 # Pipeline execution, cached per configuration
 # ════════════════════════════════════════════════════════════
 #: Generate the longest run anyone asks for and slice it, so the research
-#: dashboard at 6 frames and the Live Demo at 12 share one generation
-#: instead of paying for the scans twice.
-_MAX_FRAMES = 24
+#: dashboard and the two visualisation tabs share one generation instead of
+#: paying for the scans several times over. Must be >= the visualisation
+#: tabs' MAX_FRAMES or their slider would ask for frames that were never
+#: generated.
+_MAX_FRAMES = 40
 
 
 @st.cache_resource(show_spinner=False)

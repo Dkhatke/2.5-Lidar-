@@ -33,13 +33,22 @@ from adaptive_lidar.visualization import ui_layout as UI
 from adaptive_lidar.visualization import profile as PROFILE
 from adaptive_lidar.visualization.playback_controller import PlaybackController
 
+from adaptive_lidar.visualization.live_demo import (  # noqa: E402
+    DEFAULT_FRAMES, MAX_FRAMES, MIN_FRAMES)
+
 RAIL_H = 620
 CANVAS_H = 620
 
-#: Measured floor on this tab's redraw: building the payload is ~55 ms and
-#: shipping ~400 kB of it to the browser is the rest. Scheduling below this
-#: queues reruns and the scene receives them out of order.
-MIN_REDRAW_S = 0.40
+#: Measured floor on this tab's redraw, per draw budget: building the
+#: payload is ~55 ms and shipping it to the browser is the rest, so the
+#: floor tracks how much is being shipped. Scheduling below it queues
+#: reruns and the browser then receives them out of order.
+#:
+#: Measured at ~103 ms of server time for the Balanced budget once only
+#: the owning tab renders (before ownership, both tabs redrew on every
+#: tick and it looked like 300 ms). These leave headroom for the browser
+#: half — decoding the payload and rebuilding 18,000 instances.
+REDRAW_FLOOR_S = {"Light": 0.15, "Balanced": 0.25, "Full": 0.45}
 _CLICK_KEY = "_scene_last_click"
 
 #: Draw-budget presets. The count is the cap on cells sent to the browser;
@@ -70,14 +79,13 @@ def _left_rail() -> Dict[str, Any]:
     # there, because they are one run. Each tab keys its own widget and
     # both sync to the one session slot — Streamlit refuses a duplicate
     # widget key even across tabs.
-    SESSION.pull("scene_scenario", SESSION.SCENARIO_KEY, "mixed_urban")
+    SESSION.sync("scene_scenario", SESSION.SCENARIO_KEY, "mixed_urban")
     scenario = st.selectbox("Scenario", SCENARIOS, key="scene_scenario",
                             label_visibility="collapsed")
-    SESSION.push("scene_scenario", SESSION.SCENARIO_KEY)
 
-    SESSION.pull("scene_n_frames", SESSION.N_FRAMES_KEY, 12)
-    n_frames = st.slider("Frames", 6, 24, key="scene_n_frames")
-    SESSION.push("scene_n_frames", SESSION.N_FRAMES_KEY)
+    SESSION.sync("scene_n_frames", SESSION.N_FRAMES_KEY, DEFAULT_FRAMES)
+    n_frames = st.slider("Frames", MIN_FRAMES, MAX_FRAMES,
+                         key="scene_n_frames")
 
     UI.rail_heading("Colour by")
     colour_by = st.selectbox("Colour by", SD.COLOUR_MODES,
@@ -124,12 +132,11 @@ def _left_rail() -> Dict[str, Any]:
                                        "browser, nearest first. Anything "
                                        "dropped is counted under the canvas "
                                        "rather than quietly thinned out.")
-        SESSION.pull("scene_gate", SESSION.GATE_KEY, True)
+        SESSION.sync("scene_gate", SESSION.GATE_KEY, True)
         st.checkbox("MOS gate", key="scene_gate",
                     help="Shared with the Live demo. OFF writes moving "
                          "points into the persistent map — the trail "
                          "ablation, pre-computed either way.")
-        SESSION.push("scene_gate", SESSION.GATE_KEY)
     return {"scenario": scenario, "n_frames": n_frames,
             "colour_by": colour_by, "height_mode": height_mode,
             "detail": detail}
@@ -213,7 +220,7 @@ def _geometry_note(obj: Dict[str, Any]) -> None:
 # The tab
 # ════════════════════════════════════════════════════════════
 def render_scene_demo(precompute_fn: Callable[..., Any],
-                      n_frames_default: int = 12) -> None:
+                      n_frames_default: int = DEFAULT_FRAMES) -> None:
     """Draw the Scene demo tab.
 
     ``precompute_fn(scenario, n_frames, gate)`` must be cached by the
@@ -251,7 +258,10 @@ def render_scene_demo(precompute_fn: Callable[..., Any],
         # simply skips frames. The frame shown is still whatever the
         # shared clock says at the moment it draws, so the two tabs never
         # disagree about where playback is.
-        interval = max(pb0.interval_s(), MIN_REDRAW_S)
+        if SESSION.owns_ticker("scene"):
+            floor = REDRAW_FLOOR_S.get(
+                st.session_state.get("scene_detail", "Balanced"), 0.40)
+            interval = max(pb0.interval_s(), floor)
     PROFILE.log("arm", f"scene interval={interval} "
                        f"playing={getattr(pb0, 'playing', None)}")
 
@@ -265,6 +275,8 @@ def render_scene_demo(precompute_fn: Callable[..., Any],
 
 def _workspace(precompute_fn: Callable[..., Any]) -> None:
     import streamlit as st
+    import time as _t
+    _t0 = _t.perf_counter()
 
     left, centre, right = UI.workspace((1.05, 3.25, 1.5))
 
@@ -291,8 +303,14 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
     # meant rendering the value the other tab's ticker happened to
     # leave behind, which made the displayed frame jump backwards
     # whenever the two fragments got out of step.
-    pb.tick_if_playing()
+    # Only the tab driving playback advances the frame; the other shows
+    # whatever the shared state holds. Two tickers on one index play the
+    # run at the sum of their render rates.
+    if SESSION.owns_ticker("scene"):
+        pb.tick_if_playing()
     idx = min(pb.state.frame_idx, n - 1)
+    _report = lambda: PROFILE.log(
+        "scene", f"{(_t.perf_counter() - _t0) * 1000:7.1f} ms  frame {idx}")
     snap = run.frames[idx]
 
     sel: Optional[SEL.Selection] = SESSION.get_selection()
@@ -339,10 +357,12 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
             _right_rail(sel, snap, frame_idx=idx, n_frames=n)
 
     st.markdown("")
-    pb.render_transport(scene_time_s=snap.timestamp)
+    pb.render_transport(scene_time_s=snap.timestamp,
+                        driving=SESSION.owns_ticker("scene"))
     sp1, _sp2 = st.columns([1, 5])
     with sp1:
         pb.speed_selector()
+    _report()
 
 
 def _apply_click(click: Dict[str, Any], snap, idx: int) -> None:

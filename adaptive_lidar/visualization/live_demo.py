@@ -45,6 +45,13 @@ from adaptive_lidar.visualization.drive_tab import PRESETS, scene_diagnostics
 from adaptive_lidar.visualization import profile as PROFILE
 from adaptive_lidar.visualization.playback_controller import PlaybackController
 
+#: How long a run can be. The scans are raycast once per scenario and
+#: memoised to `.scan_cache/`, so a longer run costs generation time on the
+#: first load of a scenario and nothing after that. 24 frames is 2.4 s of
+#: scene at 10 Hz, which is long enough for the vehicle to drive past the
+#: 70 m pedestrian and for the resolution island to visibly travel with it.
+MIN_FRAMES, MAX_FRAMES, DEFAULT_FRAMES = 8, 40, 24
+
 #: Fixed height for the two side rails, in pixels. Chosen to match the
 #: canvas so the workspace fits one screen and the transport stays visible.
 RAIL_H = 640
@@ -107,15 +114,15 @@ def _left_rail(scenarios, n_frames_default: int) -> Dict[str, Any]:
     # they are shared with the Scene demo tab. Each tab keys its own widget
     # — Streamlit refuses a duplicate key even across tabs — and both read
     # and write one session slot.
-    SESSION.pull("drive_scenario", SESSION.SCENARIO_KEY, "mixed_urban")
+    SESSION.sync("drive_scenario", SESSION.SCENARIO_KEY, "mixed_urban")
     scenario = st.selectbox("Scenario", scenarios, key="drive_scenario",
                             label_visibility="collapsed")
-    SESSION.push("drive_scenario", SESSION.SCENARIO_KEY)
     c1, c2 = st.columns(2)
     with c1:
-        SESSION.pull("drive_n_frames", SESSION.N_FRAMES_KEY, n_frames_default)
-        n_frames = st.slider("Frames", 6, 24, key="drive_n_frames")
-        SESSION.push("drive_n_frames", SESSION.N_FRAMES_KEY)
+        SESSION.sync("drive_n_frames", SESSION.N_FRAMES_KEY,
+                     n_frames_default)
+        n_frames = st.slider("Frames", MIN_FRAMES, MAX_FRAMES,
+                             key="drive_n_frames")
     with c2:
         zoom = st.slider("Zoom", 0.5, 2.5, 1.0, 0.1, key="drive_zoom")
     frame_ref = st.radio("View frame", CAM.FRAME_CHOICES,
@@ -155,12 +162,11 @@ def _left_rail(scenarios, n_frames_default: int) -> Dict[str, Any]:
             _refresh()
 
     with st.expander("Advanced", expanded=False):
-        SESSION.pull("drive_gate", SESSION.GATE_KEY, True)
+        SESSION.sync("drive_gate", SESSION.GATE_KEY, True)
         st.checkbox("MOS gate", key="drive_gate",
                     help="OFF writes moving points into the persistent map. "
                          "Both variants are pre-computed, so this is "
                          "instant — it is an ablation, not a setting.")
-        SESSION.push("drive_gate", SESSION.GATE_KEY)
         st.checkbox("Predicted path", key="drive_predict",
                     help="2 s constant-velocity extrapolation of a MOVING "
                          "track. Not a prediction model.")
@@ -233,7 +239,7 @@ def _right_rail(sel: Optional[SEL.Selection], snap, *, frame_idx: int,
 # The tab
 # ════════════════════════════════════════════════════════════
 def render_live_demo(precompute_fn: Callable[..., Any],
-                     n_frames_default: int = 12) -> None:
+                     n_frames_default: int = DEFAULT_FRAMES) -> None:
     """Draw the Live Demo tab. ``precompute_fn(scenario, n_frames, gate)``
     is expected to be cached by the caller — it is the only expensive call
     in this tab, and it must not be reachable from a frame advance."""
@@ -267,7 +273,8 @@ def render_live_demo(precompute_fn: Callable[..., Any],
         # machine is strictly monotonic. The frame is derived from the
         # clock, so a slower timer skips frames rather than slowing the
         # scene down.
-        interval = max(pb0.interval_s(), MIN_REDRAW_S)
+        if SESSION.owns_ticker("live"):
+            interval = max(pb0.interval_s(), MIN_REDRAW_S)
     PROFILE.log("arm", f"live interval={interval} "
                        f"playing={getattr(pb0, 'playing', None)}")
 
@@ -314,7 +321,11 @@ def _workspace(precompute_fn: Callable[..., Any],
     # meant rendering the value the other tab's ticker happened to
     # leave behind, which made the displayed frame jump backwards
     # whenever the two fragments got out of step.
-    pb.tick_if_playing()
+    # Only the tab driving playback advances the frame; the other shows
+    # whatever the shared state holds. Two tickers on one index play the
+    # run at the sum of their render rates.
+    if SESSION.owns_ticker("live"):
+        pb.tick_if_playing()
     idx = min(pb.state.frame_idx, n - 1)
     snap = run.frames[idx]
 
@@ -371,7 +382,8 @@ def _workspace(precompute_fn: Callable[..., Any],
     # Outside the three columns deliberately: inside the centre column the
     # four buttons are narrow enough that their labels truncate to "◀…".
     st.markdown("")
-    pb.render_transport(scene_time_s=snap.timestamp)
+    pb.render_transport(scene_time_s=snap.timestamp,
+                        driving=SESSION.owns_ticker("live"))
     sp1, _sp2 = st.columns([1, 5])
     with sp1:
         pb.speed_selector()

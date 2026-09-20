@@ -32,24 +32,53 @@ N_FRAMES_KEY = "fovea_n_frames"
 GATE_KEY = "fovea_gate"
 
 
-def pull(widget_key: str, shared_key: str, default: Any) -> None:
-    """Load the shared value into this tab's widget slot, before drawing.
+#: The tab that currently drives playback. Only the owner schedules a
+#: timer and only the owner advances the frame — two tickers on one shared
+#: index makes the run play at the sum of their rates.
+TICKER_KEY = "fovea_ticker"
 
-    This is what makes a scenario chosen in one tab show up in the other:
-    Streamlit reads a keyed widget's value out of session state, so writing
-    it beforehand is how a widget is told to move.
+
+def sync(widget_key: str, shared_key: str, default: Any) -> None:
+    """Two-way bind one tab's widget to a shared session slot.
+
+    Call once, immediately BEFORE creating the widget.
+
+    The naive version of this — "copy shared into the widget, draw, copy
+    the widget back" — silently reverts the user. Streamlit writes a
+    changed widget value into session state before the script runs, so the
+    copy-in overwrites the selection that was just made and the dropdown
+    springs back to its previous value. It is exactly why every scenario
+    except the default appeared not to work.
+
+    So the direction is decided by comparing both sides against the value
+    last agreed on: whichever one moved is the one that wins.
     """
     import streamlit as st
+    seen = f"_{widget_key}_seen"
     st.session_state.setdefault(shared_key, default)
-    if st.session_state.get(widget_key) != st.session_state[shared_key]:
-        st.session_state[widget_key] = st.session_state[shared_key]
+    st.session_state.setdefault(widget_key, st.session_state[shared_key])
+
+    widget = st.session_state[widget_key]
+    shared = st.session_state[shared_key]
+    agreed = st.session_state.get(seen, shared)
+
+    if widget != agreed:            # this tab's control moved
+        st.session_state[shared_key] = widget
+    elif shared != agreed:          # the other tab moved it
+        st.session_state[widget_key] = shared
+    st.session_state[seen] = st.session_state[shared_key]
 
 
-def push(widget_key: str, shared_key: str) -> None:
-    """Publish what the user just set, after drawing."""
+def owns_ticker(tab: str, default: str = "live") -> bool:
+    """Whether ``tab`` is the one driving playback right now."""
     import streamlit as st
-    if widget_key in st.session_state:
-        st.session_state[shared_key] = st.session_state[widget_key]
+    return st.session_state.get(TICKER_KEY, default) == tab
+
+
+def claim_ticker(tab: str) -> None:
+    """Take over playback. Called when a transport control is used."""
+    import streamlit as st
+    st.session_state[TICKER_KEY] = tab
 
 
 def get_selection() -> Optional[Any]:

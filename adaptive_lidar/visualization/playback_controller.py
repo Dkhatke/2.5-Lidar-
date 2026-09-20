@@ -34,8 +34,11 @@ from typing import Callable, Dict, Optional
 from adaptive_lidar.visualization import profile as PROFILE
 
 #: Replay speed multipliers offered in the transport.
-SPEEDS: Dict[str, float] = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0,
-                            "2x": 2.0, "4x": 4.0}
+#: 0.1x is a second per frame: slow enough to talk over, which is what a
+#: walk-through actually needs. The fast end is bounded by the redraw, so
+#: 2x and 4x mostly mean "as fast as this view can draw".
+SPEEDS: Dict[str, float] = {"0.1x": 0.1, "0.25x": 0.25, "0.5x": 0.5,
+                            "1x": 1.0, "2x": 2.0, "4x": 4.0}
 
 #: Wall-clock seconds per displayed frame at 1x. The scenes are 10 Hz, so
 #: this is real time; it is a REPLAY rate and is labelled as one, because it
@@ -131,20 +134,11 @@ class PlaybackState:
         self.started_at = float(now)
         self.start_frame = self.frame_idx
 
-    def frame_at(self, now: float) -> int:
-        """The frame the CLOCK says should be showing.
-
-        Playback is a function of elapsed time, not of how many times
-        something redrew. Two tabs each hold a transport bound to this one
-        state, and each re-renders at its own speed; if every redraw
-        advanced the index, the run would play at the sum of their rates
-        and neither would show a steady 10 Hz scene. Deriving the index
-        from the clock makes the extra renderer free.
-        """
-        if self.started_at is None or self.n_frames <= 0:
-            return self.frame_idx
-        k = int((float(now) - self.started_at) / self.interval_s())
-        return self._wrap(self.start_frame + max(k, 0))
+    def due(self, now: float) -> bool:
+        """Whether enough wall clock has passed to show the next frame."""
+        if self.started_at is None:
+            return False
+        return (float(now) - self.started_at) >= self.interval_s()
 
     def _wrap(self, i: int) -> int:
         if self.n_frames <= 0:
@@ -231,8 +225,8 @@ class PlaybackController:
 
     # ── the transport row ────────────────────────────────────
     def render_transport(self, scene_time_s: Optional[float] = None,
-                         *, on_change: Optional[Callable[[], None]] = None
-                         ) -> int:
+                         *, on_change: Optional[Callable[[], None]] = None,
+                         driving: bool = True) -> int:
         """Draw [◀ Previous][▶ Play][⏭ Next][Reset] + timeline + readout.
 
         Returns the frame index to display. Nothing here loads or computes
@@ -242,6 +236,17 @@ class PlaybackController:
 
         s = self.state
         scoped = self.supports_fragment_scope()
+
+        def _claim():
+            """This tab is now the one driving playback.
+
+            Only one tab may tick: two tabs each advancing the shared
+            index would play the run at the sum of their render rates.
+            Ownership follows the last transport press, which is the tab
+            the user is looking at.
+            """
+            from adaptive_lidar.visualization import session as _sess
+            _sess.claim_ticker(self.key)
 
         def _rerun(scope: str = "fragment"):
             """Redraw.
@@ -268,6 +273,7 @@ class PlaybackController:
             if st.button("◀ Previous", key=f"{self.key}_prev",
                          width="stretch", disabled=s.n_frames <= 1,
                          help="One frame back. Pauses."):
+                _claim()
                 s.previous()
                 _rerun("app")          # stepping pauses, so the timer stops
         with c_play:
@@ -275,6 +281,7 @@ class PlaybackController:
             if st.button(label, key=f"{self.key}_play", width="stretch",
                          type="primary" if not s.playing else "secondary",
                          disabled=s.n_frames <= 1):
+                _claim()
                 s.toggle()
                 PROFILE.log("toggle", f"{self.key} playing={s.playing}")
                 _rerun("app")          # the timer schedule changes
@@ -282,27 +289,32 @@ class PlaybackController:
             if st.button("⏭ Next", key=f"{self.key}_next", width="stretch",
                          disabled=s.n_frames <= 1,
                          help="One frame forward. Pauses."):
+                _claim()
                 s.next()
                 _rerun("app")          # stepping pauses, so the timer stops
         with c_reset:
             if st.button("↺ Reset", key=f"{self.key}_reset", width="stretch",
                          help="Back to frame 1 and pause."):
+                _claim()
                 s.reset()
                 _rerun("app")          # reset pauses, so the timer stops
 
         with c_bar:
             if s.n_frames <= 1:
                 st.caption("Single frame — nothing to play.")
-            elif s.playing:
-                # While playing the timeline is a READOUT, not a widget.
+            elif s.playing or not driving:
+                # A READOUT, not a widget, whenever this tab is not the one
+                # a scrub should come from.
                 #
-                # A keyed slider has to be written on every redraw to make
-                # the handle follow the clock, Streamlit treats each of
-                # those writes as a change and fires `on_change`, and with
-                # two tabs each holding a transport bound to one state the
-                # two sliders then scrub each other backwards several times
-                # a second. A progress bar has no widget state to fight
-                # over, and the handle still shows the position.
+                # Two things went wrong with a live slider here. Streamlit
+                # fires `on_change` for the value the SERVER writes, so
+                # syncing the handle to playback looked like a scrub
+                # several times a second. And with a slider in each tab
+                # bound to one index, the one that had been idle reported
+                # a position from before playback moved — which read as a
+                # drag, seeked backwards, and cascaded reruns until it
+                # caught up. A progress bar has no widget state to fight
+                # over, and the position is still visible.
                 frac = (s.frame_idx / max(s.last, 1)) * 100.0
                 st.markdown(
                     f'<div style="height:6px;border-radius:3px;'
@@ -312,10 +324,18 @@ class PlaybackController:
                     unsafe_allow_html=True)
             else:
                 bar = f"{self.key}_bar"
+                echo = f"_{bar}_written"
+                # The value we wrote LAST time. If the frontend sends it
+                # back after the index has moved on, that is a stale echo
+                # rather than a drag, and acting on it walks the playhead
+                # backwards.
+                stale = st.session_state.get(echo)
                 st.session_state[bar] = s.frame_idx
+                st.session_state[echo] = s.frame_idx
                 i = st.slider("Timeline", 0, s.last, key=bar,
                               label_visibility="collapsed")
-                if i != s.frame_idx:
+                if i != s.frame_idx and i != stale:
+                    _claim()
                     s.seek(i)
                     if on_change is not None:
                         on_change()
@@ -331,6 +351,11 @@ class PlaybackController:
                 f'pipeline</span></div>',
                 unsafe_allow_html=True)
 
+        if s.playing and not driving:
+            st.caption(
+                "Playing, but driven from the other tab — press ▶ here to "
+                "take it over. Only one view advances the frame; two would "
+                "play the run at twice the rate.")
         return s.frame_idx
 
     def speed_selector(self, label: str = "Replay speed") -> str:
@@ -344,15 +369,13 @@ class PlaybackController:
         if st.session_state.get(sk) != s.speed:
             st.session_state[sk] = s.speed
         chosen = st.selectbox(label, opts, key=sk,
-                              help="Playback rate only. It changes nothing "
-                                   "the pipeline measured. The achieved "
-                                   "rate is bounded by the redraw: ~95 ms "
-                                   "of server time per displayed frame at "
-                                   "the default canvas on this machine, and "
-                                   "~460 ms end to end once the browser "
-                                   "round trip is included. Set "
-                                   "FOVEA_PROFILE=1 to print the server "
-                                   "half to the console.")
+                              help="How long each frame is held for. It "
+                                   "changes nothing the pipeline measured. "
+                                   "One frame is shown per redraw, so a "
+                                   "setting faster than the redraw simply "
+                                   "plays at the redraw rate rather than "
+                                   "skipping frames. Set FOVEA_PROFILE=1 "
+                                   "to print the real per-redraw cost.")
         s.speed = chosen
         if chosen != before and s.playing:
             # The interval feeds run_every, which is set on the enclosing
@@ -364,11 +387,14 @@ class PlaybackController:
     def tick_if_playing(self, now: Optional[float] = None) -> bool:
         """Called at the END of the fragment body, once it has drawn.
 
-        Sets the frame from the clock rather than incrementing it. That is
-        what makes a second view of the same run free: a fragment reruns
-        both on its ``run_every`` timer and on any widget inside it, two
-        tabs each hold a transport, and none of that may change how fast
-        the scene plays.
+        Advances by AT MOST ONE frame, and only once the interval has
+        elapsed. Deriving the index from the clock instead — frame =
+        elapsed / interval — looks right on paper and is wrong in
+        practice: a redraw costs far more than the 100 ms a frame is meant
+        to be shown for, so every redraw jumped three or four frames and
+        the run cycled through the same three of twelve. Showing every
+        frame in order, a little slower than real time, is what a demo
+        needs; the readout calls it a replay rate for exactly this reason.
 
         Returns True if the frame index moved.
         """
@@ -379,11 +405,13 @@ class PlaybackController:
             return False
         t = _time.monotonic() if now is None else float(now)
         if s.started_at is None:
-            PROFILE.log("clock", f"{self.key} restart at {s.frame_idx}")
+            PROFILE.log("clock", f"{self.key} start at {s.frame_idx}")
             s.start_clock(t)
             return False
-        before = s.frame_idx
-        s.frame_idx = s.frame_at(t)
+        if not s.due(t):
+            return False
+        s.start_clock(t)
+        s.frame_idx = s._wrap(s.frame_idx + 1)
         if not s.loop and s.frame_idx >= s.last:
             s.playing = False
-        return s.frame_idx != before
+        return True

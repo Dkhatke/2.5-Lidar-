@@ -159,54 +159,58 @@ def test_run_every_is_none_for_a_single_frame():
     assert c.run_every() is None
 
 
-def test_the_frame_follows_the_clock_not_the_redraw_count():
-    """A redraw is not a frame.
+def test_a_slow_renderer_still_shows_every_frame():
+    """The bug this contract exists to prevent.
 
-    A fragment reruns both on its timer and on any widget inside it, and
-    two tabs each hold a transport bound to this one state. If every
-    redraw incremented the index, the run would play at the sum of their
-    render rates. It is a function of elapsed time instead.
+    A redraw costs far more than the 100 ms a frame is meant to be held
+    for. Deriving the index from elapsed time — frame = elapsed /
+    interval — therefore jumped three or four frames per redraw, and a
+    12-frame run cycled through the same three of them: "it plays only 3
+    frames and jumps around randomly". One frame per tick, however late
+    the tick is.
     """
+    c = PlaybackController(state=PlaybackState(12, playing=True,
+                                               speed="1x"))
+    c.tick_if_playing(now=0.0)              # starts the interval
+    seen = [c.state.frame_idx]
+    for k in range(1, 13):
+        c.tick_if_playing(now=k * 0.45)     # a redraw 4.5x the interval
+        seen.append(c.state.frame_idx)
+    assert seen == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
+
+
+def test_redraws_inside_the_interval_do_not_advance():
+    """A fragment reruns for reasons other than its timer."""
     c = PlaybackController(state=PlaybackState(100, playing=True,
                                                speed="1x"))
-    assert c.tick_if_playing(now=100.0) is False       # starts the clock
-    assert c.state.frame_idx == 0
-    c.tick_if_playing(now=100.35)
-    assert c.state.frame_idx == 3                      # 350 ms at 100 ms
-    # Ten extra redraws in the same instant change nothing.
+    c.tick_if_playing(now=100.0)
     for _ in range(10):
-        c.tick_if_playing(now=100.35)
-    assert c.state.frame_idx == 3
+        assert c.tick_if_playing(now=100.04) is False
+    assert c.state.frame_idx == 0
+    assert c.tick_if_playing(now=100.11) is True
+    assert c.state.frame_idx == 1
 
 
-def test_two_renderers_do_not_double_the_playback_rate():
-    """The property the whole clock-driven design exists for.
-
-    Live demo and Scene demo both bind to one PlaybackState and both
-    re-render on their own timers. Playing must look the same as it would
-    with one of them.
-    """
-    state = PlaybackState(100, playing=True, speed="1x")
-    a = PlaybackController(key="live", state=state)
-    b = PlaybackController(key="scene", state=state)
-    a.tick_if_playing(now=50.0)
-    for k in range(1, 21):
-        t = 50.0 + k * 0.05
-        a.tick_if_playing(now=t)       # the fast tab
-        b.tick_if_playing(now=t)       # the slow one, same instant
-    # One second of wall clock at 1x is ten frames, whoever drew it.
-    assert state.frame_idx == 10
+@pytest.mark.parametrize("speed", list(SPEEDS))
+def test_the_interval_is_respected_at_every_speed(speed):
+    c = PlaybackController(state=PlaybackState(100, playing=True,
+                                               speed=speed))
+    step = c.state.interval_s()
+    c.tick_if_playing(now=0.0)
+    assert c.tick_if_playing(now=step * 0.9) is False
+    assert c.tick_if_playing(now=step * 1.1) is True
 
 
-def test_scrubbing_restarts_the_clock_from_where_it_was_dropped():
+def test_scrubbing_restarts_the_interval_from_where_it_was_dropped():
     c = PlaybackController(state=PlaybackState(100, playing=True))
     c.tick_if_playing(now=10.0)
     c.tick_if_playing(now=10.5)
-    assert c.state.frame_idx == 5
+    assert c.state.frame_idx == 1
     c.state.seek(60)
-    c.tick_if_playing(now=10.6)        # re-arms
+    c.tick_if_playing(now=10.6)        # re-arms, does not advance
+    assert c.state.frame_idx == 60
     c.tick_if_playing(now=10.9)
-    assert c.state.frame_idx == 63
+    assert c.state.frame_idx == 61
 
 
 # ════════════════════════════════════════════════════════════

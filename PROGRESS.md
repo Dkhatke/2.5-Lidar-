@@ -1311,3 +1311,98 @@ gained the clock-driven and two-renderer properties.
 * **Both tabs animate when playing, including the hidden one.** Streamlit
   cannot tell which tab is visible. The clock-driven frame keeps that
   correct, but it does cost a redraw the viewer never sees.
+
+## PHASE 14 — THREE BUGS FROM USING IT ✅
+
+All three were reported from the running app, and all three are the kind
+that a unit test would only have caught if someone had thought to write it.
+They now have those tests.
+
+### "It plays only 3 frames and jumps around randomly"
+
+Exactly what the code did. Playback derived the frame from elapsed time:
+
+```
+frame = start + (now - started_at) / interval
+```
+
+which is correct if a redraw is cheap. A redraw is not cheap — 100 to
+300 ms against the 100 ms a frame is supposed to be held for — so every
+redraw advanced three or four frames, and a 12-frame run cycled through
+the same three of them. The scene never looked like it was moving; it
+looked like it was shuffling.
+
+Now the frame advances by **at most one per redraw**, and only once the
+interval has elapsed. Every frame is shown, in order, a little slower than
+the scene really ran, which is what the readout has always called a replay
+rate.
+
+Two related fixes fell out of it:
+
+* **Only one tab drives playback.** Both tabs bind to one shared index, so
+  when both ticked the run played at the sum of their render rates. The
+  ticker is now owned by whichever tab last used a transport control; the
+  other shows the position and says where it is being driven from. The
+  hidden tab also stops redrawing, which is most of why the visible one
+  got faster.
+* **The timeline is only a widget in the tab that owns it, and only when
+  paused.** A slider has to be written on every redraw to follow playback,
+  Streamlit fires `on_change` for the value the *server* writes, and with
+  one in each tab the idle one reported a position from before playback
+  moved — which read as a drag, seeked backwards, and cascaded reruns
+  until it caught up. A progress bar has no widget state to fight over.
+
+Measured after, one frame per redraw and nothing skipped:
+
+```
+live demo   0 1 2 ... 23 0 1 2 ...     ~200 ms per frame
+scene demo  0 1 2 ... 23 0 1 2 ...     ~215 ms per frame
+```
+
+### "Only mixed_urban gets selected"
+
+`session.pull()` copied the shared scenario into the widget slot before
+the widget was drawn. Streamlit writes a *changed* widget value into
+session state **before** the script runs, so that copy landed on top of the
+selection the user had just made and the dropdown sprang back. Every
+scenario except the default was unreachable, in both tabs.
+
+`session.sync()` replaces it and decides the direction by comparing both
+sides against the value last agreed on: whichever one moved is the one
+that wins. `tests/test_session.py` pins it down, including the exact
+sequence that failed.
+
+All six scenarios load — this was never a data problem:
+
+```
+empty_road         ok   75,518 cells   6 objects
+pedestrian_far     ok   76,056 cells   7 objects
+canopy_over_road   ok   81,262 cells  10 objects
+moving_vehicle     ok   77,310 cells   7 objects
+convoy             ok   90,315 cells  50 objects
+mixed_urban        ok   78,420 cells  90 objects
+```
+
+### "Keep more frames so we can show a proper demo"
+
+8 to 40 frames, default **24** — 2.4 s of scene at 10 Hz, long enough for
+the vehicle to drive past the 70 m pedestrian and for the resolution
+island to visibly travel with it. `_MAX_FRAMES` in `app.py` was raised to
+match, since it caps what the loader generates.
+
+The scans are raycast once per scenario and memoised to `.scan_cache/`, so
+the cost lands on the first load of a scenario and never again:
+
+```
+empty_road         40 scans in   0.7 s        (cached)
+pedestrian_far     40 scans in   0.9 s        (cached)
+canopy_over_road   40 scans in  10.6 s
+moving_vehicle     40 scans in  14.4 s
+convoy             40 scans in  32.8 s
+mixed_urban        40 scans in  51.7 s
+```
+
+A `0.1x` replay speed was added at the same time: a second per frame, slow
+enough to talk over, which is what a walk-through actually needs.
+
+Tests: 213 → **231**.
