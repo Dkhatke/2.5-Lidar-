@@ -56,10 +56,10 @@ MIN_FRAMES, MAX_FRAMES, DEFAULT_FRAMES = 8, 40, 24
 #: canvas so the workspace fits one screen and the transport stays visible.
 RAIL_H = 640
 
-#: Measured floor on this tab's redraw: ~95 ms of server time for the
-#: canvas plus the PNG encode, so scheduling below this only builds a
-#: backlog. Set FOVEA_PROFILE=1 to see the real numbers.
-MIN_REDRAW_S = 0.15
+#: A LOWER BOUND only. The interval used is whichever is larger of this,
+#: the requested speed, and 1.5x the measured redraw — see
+#: `session.paced_interval`. Set FOVEA_PROFILE=1 to watch it settle.
+MIN_REDRAW_S = 0.12
 
 
 
@@ -274,7 +274,8 @@ def render_live_demo(precompute_fn: Callable[..., Any],
         # clock, so a slower timer skips frames rather than slowing the
         # scene down.
         if SESSION.owns_ticker("live"):
-            interval = max(pb0.interval_s(), MIN_REDRAW_S)
+            interval = SESSION.paced_interval("live", pb0.interval_s(),
+                                          floor=MIN_REDRAW_S)
     PROFILE.log("arm", f"live interval={interval} "
                        f"playing={getattr(pb0, 'playing', None)}")
 
@@ -393,8 +394,10 @@ def _workspace(precompute_fn: Callable[..., Any],
         scene_diagnostics(run, run_on, run_off, snap, idx,
                           result.corridor_area, result.drawn_objects)
 
-    PROFILE.log("frag", f"{(_t.perf_counter() - _t0) * 1000:7.1f} ms  "
-                        f"frame {idx}")
+    _took = _t.perf_counter() - _t0
+    SESSION.record_redraw("live", _took)
+    PROFILE.log("frag", f"{_took * 1000:7.1f} ms  frame {idx}  "
+                        f"pace {SESSION.redraw_cost('live'):.3f}")
 
 
 def _metrics_strip(run, snap, result, idx: int) -> None:

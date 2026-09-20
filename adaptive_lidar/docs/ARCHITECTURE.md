@@ -268,7 +268,7 @@ adaptive_lidar/
     drive_tab.py           scene presets + the diagnostics panel
   scripts/                 profiling, training, the five verifications,
                            baselines, report generation
-  tests/                   239 tests, including the gt-isolation guard
+  tests/                   248 tests, including the gt-isolation guard
 ```
 
 ---

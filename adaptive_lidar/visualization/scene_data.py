@@ -156,8 +156,8 @@ def select_cells(cells: Dict[str, np.ndarray], ego_xy: Tuple[float, float],
 
 
 def cell_geometry(cells: Dict[str, np.ndarray], keep: np.ndarray,
-                  *, profile: Optional[VehicleProfile] = None
-                  ) -> Dict[str, Any]:
+                  *, profile: Optional[VehicleProfile] = None,
+                  need_traversability: bool = True) -> Dict[str, Any]:
     """The packed per-cell buffers the renderer instances from.
 
     One entry per cell: centre, footprint (its true resolution), base
@@ -177,7 +177,14 @@ def cell_geometry(cells: Dict[str, np.ndarray], keep: np.ndarray,
     # the inspector still shows both stored numbers unclamped.
     top = np.maximum(zmax, gz)
 
-    verdict = INS.traversability_arrays(cells, profile)[keep]
+    # Only computed when something is going to use it. The verdict needs a
+    # neighbour lookup per cell, and it was being computed for all ~78,000
+    # cached cells on every redraw to colour 18,000 of them — in a mode
+    # that usually is not even selected.
+    if need_traversability:
+        verdict = INS.traversability_arrays(cells, profile, keep)[keep]
+    else:
+        verdict = np.zeros(keep.size, np.int8)
     npts = np.asarray(cells["n_points"], np.float32)[keep]
     zq = np.clip(np.stack([gz, top], 1).ravel() * _Z_QUANT,
                  -32768, 32767)
@@ -301,7 +308,8 @@ def build_scene_data(snapshot, *, frame_idx: int, n_frames: int,
     ego = snapshot.ego_xy
     keep, dropped = select_cells(snapshot.cells, ego, radius_m=radius_m,
                                  max_cells=max_cells)
-    cells = cell_geometry(snapshot.cells, keep, profile=profile)
+    cells = cell_geometry(snapshot.cells, keep, profile=profile,
+                          need_traversability=(colour_by == "traversability"))
 
     objects = [object_to_scene_object(o, ego)
                for o in (snapshot.objects or [])

@@ -1426,3 +1426,65 @@ asserting on the source — the choice is kept, it survives a redraw, it
 reruns the app so `run_every` is re-armed, and both tabs see one speed.
 
 Tests: 231 → **239**.
+
+### Follow-up: the scene went white and stuttered above 0.1x
+
+Three separate costs, and the first one explains the white screen.
+
+**The renderer threw away its GPU buffers every frame.** `buildCells`
+disposed the InstancedMesh and built a new one per redraw: at 18,000 cells
+that is 1.15 MB of instance matrices plus 216 kB of instance colours
+allocated, uploaded and discarded several times a second. Enough churn to
+stall an integrated driver and eventually lose the WebGL context — which
+is exactly what a white canvas is. The mesh is now allocated once at a
+capacity that only grows, and a frame overwrites the buffers it already
+owns and sets `count`. Matrices and colours are written straight into the
+attribute arrays, because `setMatrixAt` through a Quaternion and three
+Vector3s costs more than the rest of the loop at that instance count.
+Object geometry is cached by shape and size, and the point cloud reuses
+one buffer with `setDrawRange`.
+
+```
+browser build, 18,000 cells:   full realloc  ->  12 ms
+```
+
+A `webglcontextlost` handler now rebuilds the scene instead of leaving a
+dead canvas, so even an unrelated driver hiccup recovers.
+
+**The verdict was computed for cells nobody drew.** `cell_geometry` called
+`traversability_arrays` over all ~78,000 cached cells and then indexed the
+18,000 it wanted — a neighbour lookup per cell, most of it discarded. It
+now answers only for the drawn rows (probing still resolves against every
+cell, so an edge cell still sees the neighbour beyond it), and is skipped
+entirely unless the traversability colour mode is selected.
+
+```
+build_scene_data  semantic         99 ms  ->  10 ms
+                  traversability   99 ms  ->  39 ms
+```
+
+`tests/test_scene_data.py` asserts the subset verdict is identical to the
+full one on the drawn cells — the optimisation is only worth having if it
+changes nothing.
+
+**Pacing was a constant measured on the wrong machine.** A fixed interval
+schedules reruns faster than a slower laptop can serve them; they queue,
+arrive out of order, and playback appears to stop and restart. Each tab now
+keeps an exponential moving average of what a redraw actually cost there
+and never schedules faster than 1.5x it — rising fast when the machine
+struggles, recovering slowly so it does not oscillate. The constants that
+remain are lower bounds before the first measurement lands.
+
+Also removed: a `setFrameHeight` announced on every frame for a height
+that had not changed, which was making Streamlit re-render the component
+host and roughly doubling the reruns during playback.
+
+Measured end to end, scene demo, 18,000 cells, 24 frames:
+
+```
+server redraw   460 ms  ->   30 ms   (median)
+browser build   realloc ->   12 ms
+frames          0 1 2 3 ... 23 0 1   strictly in order, context alive
+```
+
+Tests: 239 → **248**.

@@ -70,6 +70,39 @@ def sync(widget_key: str, shared_key: str, default: Any) -> None:
     st.session_state[seen] = st.session_state[shared_key]
 
 
+#: Per-tab exponential moving average of how long a redraw actually took,
+#: in seconds. Playback is paced from this rather than from a constant,
+#: because the constant was measured on one machine and the demo runs on
+#: another — on a weaker laptop a fixed interval schedules reruns faster
+#: than they can be served, they queue, and playback stutters and appears
+#: to restart.
+def redraw_cost(tab: str, default: float = 0.25) -> float:
+    import streamlit as st
+    return float(st.session_state.get(f"_redraw_{tab}", default))
+
+
+def record_redraw(tab: str, seconds: float) -> None:
+    """Fold one measured redraw into the average for ``tab``."""
+    import streamlit as st
+    key = f"_redraw_{tab}"
+    prev = st.session_state.get(key)
+    # Rises fast, falls slowly: a machine that just struggled should back
+    # off immediately, and earn its speed back gradually.
+    if prev is None:
+        new = float(seconds)
+    elif seconds > prev:
+        new = 0.4 * prev + 0.6 * float(seconds)
+    else:
+        new = 0.85 * prev + 0.15 * float(seconds)
+    st.session_state[key] = min(max(new, 0.02), 3.0)
+
+
+def paced_interval(tab: str, requested: float, *, headroom: float = 1.5,
+                   floor: float = 0.1) -> float:
+    """The timer to schedule: never faster than this tab can redraw."""
+    return max(requested, floor, redraw_cost(tab) * headroom)
+
+
 def owns_ticker(tab: str, default: str = "live") -> bool:
     """Whether ``tab`` is the one driving playback right now."""
     import streamlit as st

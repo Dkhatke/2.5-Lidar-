@@ -44,11 +44,11 @@ CANVAS_H = 620
 #: floor tracks how much is being shipped. Scheduling below it queues
 #: reruns and the browser then receives them out of order.
 #:
-#: Measured at ~103 ms of server time for the Balanced budget once only
-#: the owning tab renders (before ownership, both tabs redrew on every
-#: tick and it looked like 300 ms). These leave headroom for the browser
-#: half — decoding the payload and rebuilding 18,000 instances.
-REDRAW_FLOOR_S = {"Light": 0.15, "Balanced": 0.25, "Full": 0.45}
+#: A LOWER BOUND only. The interval actually used is whichever is larger
+#: of this, the requested speed, and 1.5x the measured redraw — see
+#: `session.paced_interval`. These numbers only stop the pacing being
+#: absurdly fast before the first measurement lands.
+REDRAW_FLOOR_S = {"Light": 0.12, "Balanced": 0.18, "Full": 0.30}
 _CLICK_KEY = "_scene_last_click"
 
 #: Draw-budget presets. The count is the cap on cells sent to the browser;
@@ -259,9 +259,15 @@ def render_scene_demo(precompute_fn: Callable[..., Any],
         # shared clock says at the moment it draws, so the two tabs never
         # disagree about where playback is.
         if SESSION.owns_ticker("scene"):
-            floor = REDRAW_FLOOR_S.get(
-                st.session_state.get("scene_detail", "Balanced"), 0.40)
-            interval = max(pb0.interval_s(), floor)
+            # Paced by what a redraw HERE actually costs, not by a
+            # constant measured on the development machine. On a weaker
+            # laptop a fixed interval schedules reruns faster than they
+            # can be served; they queue, and playback stutters and looks
+            # like it restarts.
+            interval = SESSION.paced_interval(
+                "scene", pb0.interval_s(),
+                floor=REDRAW_FLOOR_S.get(
+                    st.session_state.get("scene_detail", "Balanced"), 0.25))
     PROFILE.log("arm", f"scene interval={interval} "
                        f"playing={getattr(pb0, 'playing', None)}")
 
@@ -309,8 +315,11 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
     if SESSION.owns_ticker("scene"):
         pb.tick_if_playing()
     idx = min(pb.state.frame_idx, n - 1)
-    _report = lambda: PROFILE.log(
-        "scene", f"{(_t.perf_counter() - _t0) * 1000:7.1f} ms  frame {idx}")
+    def _report() -> None:
+        took = _t.perf_counter() - _t0
+        SESSION.record_redraw("scene", took)
+        PROFILE.log("scene", f"{took * 1000:7.1f} ms  frame {idx}  "
+                             f"pace {SESSION.redraw_cost('scene'):.3f}")
     snap = run.frames[idx]
 
     sel: Optional[SEL.Selection] = SESSION.get_selection()

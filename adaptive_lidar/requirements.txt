@@ -43,7 +43,7 @@ pillow>=10.0              # image I/O for the rendered map
 
 # ── Config and testing ─────────────────────────────────────
 pyyaml>=6.0               # config.yaml
-pytest>=7.0               # 239 tests
+pytest>=7.0               # 248 tests
 
 # ── Optional, tried at import and never required ───────────
 # pypatchworkpp           # ground segmentation; ring-geometry is the fallback

@@ -132,3 +132,64 @@ def test_the_shared_keys_are_not_widget_keys():
     for key in (SESSION.SCENARIO_KEY, SESSION.N_FRAMES_KEY,
                 SESSION.GATE_KEY, SESSION.TICKER_KEY):
         assert not key.startswith(("drive_", "scene_", "live_"))
+
+
+# ════════════════════════════════════════════════════════════
+# Self-tuning playback pace
+# ════════════════════════════════════════════════════════════
+def test_pacing_never_schedules_faster_than_a_redraw(state):
+    """The reported symptom: on a weaker laptop the scene went white and
+    playback stuttered and restarted.
+
+    A fixed interval measured on one machine schedules reruns faster than
+    another can serve them; they queue, arrive out of order, and playback
+    appears to restart. The interval is derived from what a redraw here
+    actually cost.
+    """
+    for _ in range(6):
+        SESSION.record_redraw("scene", 0.62)        # a slow machine
+    assert SESSION.redraw_cost("scene") == pytest.approx(0.62, abs=0.05)
+    # A request for 10 fps is honoured at the rate the machine can hold.
+    assert SESSION.paced_interval("scene", 0.1) >= 0.62
+
+
+def test_a_fast_machine_is_not_held_back(state):
+    for _ in range(10):
+        SESSION.record_redraw("live", 0.03)
+    # The requested speed wins when the machine can keep up with it.
+    assert SESSION.paced_interval("live", 0.5, floor=0.1) ==         pytest.approx(0.5)
+
+
+def test_the_floor_applies_before_any_measurement(state):
+    assert SESSION.paced_interval("scene", 0.01, floor=0.18) >= 0.18
+
+
+def test_it_backs_off_fast_and_recovers_slowly(state):
+    """A machine that just struggled should slow down at once.
+
+    Earning the speed back gradually avoids oscillating between a rate
+    that works and one that does not.
+    """
+    for _ in range(10):
+        SESSION.record_redraw("scene", 0.10)
+    quick = SESSION.redraw_cost("scene")
+    SESSION.record_redraw("scene", 1.00)            # one bad redraw
+    assert SESSION.redraw_cost("scene") > quick * 3
+    slow = SESSION.redraw_cost("scene")
+    SESSION.record_redraw("scene", 0.10)            # one good one
+    assert SESSION.redraw_cost("scene") > slow * 0.7
+
+
+def test_the_pace_is_clamped_to_something_sane(state):
+    SESSION.record_redraw("scene", 99.0)
+    assert SESSION.redraw_cost("scene") <= 3.0
+    SESSION.record_redraw("live", 0.0)
+    assert SESSION.redraw_cost("live") >= 0.02
+
+
+def test_each_tab_is_paced_separately(state):
+    """The 2D canvas is cheap and the scene is not; one number for both
+    would hold the cheap one back."""
+    SESSION.record_redraw("live", 0.05)
+    SESSION.record_redraw("scene", 0.60)
+    assert SESSION.redraw_cost("live") < SESSION.redraw_cost("scene")

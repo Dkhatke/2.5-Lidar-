@@ -85,7 +85,7 @@ python scripts/test_allocation.py          # retention vs budget
 python scripts/test_temporal.py            # the MOS gate
 python scripts/eval_semantic.py            # M1/M6: per-class IoU by range
 python scripts/test_interaction.py         # click -> cell, on a real run
-python -m pytest tests/ -q                 # 239 tests
+python -m pytest tests/ -q                 # 248 tests
 ```
 
 Selected measured outcomes:
@@ -194,7 +194,7 @@ adaptive_lidar/
   data/       raycast sensor model, loader, label maps
   utils/      grouping, spatial index, range image, voxel hash
   scripts/    profiling, training, verification, baselines, report
-  tests/      239 tests
+  tests/      248 tests
   models/     the trained weights
   docs/       RESULTS.md, ARCHITECTURE.md, figures, CSVs
 PROGRESS.md   the working log, with pasted verification output

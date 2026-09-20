@@ -415,3 +415,56 @@ def test_every_physical_class_does_get_a_box(cls):
     snap = _Snap(_cells([_centre(5, 5, 1) + (1,)]), [_obj(cls=cls)])
     assert len(SD.build_scene_data(snap, frame_idx=0, n_frames=1)
                ["objects"]) == 1
+
+
+# ════════════════════════════════════════════════════════════
+# The redraw optimisations, and what they must not change
+# ════════════════════════════════════════════════════════════
+def test_the_subset_verdict_equals_the_full_one():
+    """Computing the verdict only for the drawn cells must not change it.
+
+    The scene draws 18,000 of ~78,000 cached cells and used to compute the
+    verdict for all of them on every redraw — most of its cost. Restricting
+    it is only safe if a cell at the edge of the drawn set still sees the
+    neighbour beyond it, which is why `rows` limits what is ANSWERED for
+    and not what can be a neighbour.
+    """
+    rng = np.random.default_rng(12)
+    entries, n = [], 120
+    for _ in range(n):
+        lvl = int(rng.integers(0, 3))
+        entries.append(_centre(int(rng.integers(0, 25)),
+                               int(rng.integers(0, 25)), lvl) + (lvl,))
+    cells = _cells(entries)
+    cells["ground_z"][:] = rng.normal(0, 0.3, n).astype(np.float32)
+    cells["z_max"][:] = cells["ground_z"] + rng.gamma(1.0, 0.5, n)
+    cells["sem_class"][:] = rng.integers(0, 6, n)
+    cells["n_points"][:] = rng.integers(0, 40, n)
+    cells["overhead_clearance"][:] = 9.0
+
+    full = INS.traversability_arrays(cells, VehicleProfile.wheeled())
+    rows = np.sort(rng.choice(n, size=n // 3, replace=False))
+    sub = INS.traversability_arrays(cells, VehicleProfile.wheeled(), rows)
+    assert np.array_equal(full[rows], sub[rows])
+
+
+def test_the_verdict_is_skipped_unless_it_is_drawn():
+    """It costs a neighbour lookup per cell, in a mode usually not chosen."""
+    cells = _cells([_centre(5, 5, 1) + (1,)], sem_class=4, n_points=30,
+                   overhead_clearance=9.0)
+    keep = np.arange(1)
+    on = SD.cell_geometry(cells, keep, need_traversability=True)
+    off = SD.cell_geometry(cells, keep, need_traversability=False)
+    assert _unpack(on, "trav", np.uint8)[0] == Traversability.BLOCKED
+    assert _unpack(off, "trav", np.uint8)[0] == 0        # not computed
+
+
+def test_the_scene_asks_for_the_verdict_only_in_that_colour_mode():
+    snap = _Snap(_cells([_centre(5, 5, 1) + (1,)], sem_class=4, n_points=30,
+                        overhead_clearance=9.0))
+    sem = SD.build_scene_data(snap, frame_idx=0, n_frames=1,
+                              colour_by="semantic")
+    trav = SD.build_scene_data(snap, frame_idx=0, n_frames=1,
+                               colour_by="traversability")
+    assert _unpack(trav["cells"], "trav", np.uint8)[0] ==         Traversability.BLOCKED
+    assert _unpack(sem["cells"], "trav", np.uint8)[0] == 0

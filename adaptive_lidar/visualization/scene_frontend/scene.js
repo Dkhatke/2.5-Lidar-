@@ -37,7 +37,8 @@
 // ─────────────────────────────────────────────────────────────
 var S = {
   renderer: null, scene: null, camera: null,
-  cellMesh: null, cellXY: null, cellZ: null, cellSize: null,
+  cellMesh: null, cellCapacity: 0, cellXY: null,
+  pointCapacity: 0,
   objectGroup: null, egoGroup: null, ringGroup: null, pointCloud: null,
   markerGroup: null,
   objects: [], labels: [], ringLabels: [],
@@ -62,6 +63,14 @@ var CAM_MODES = [
   ["sensor", "Sensor"], ["reset", "Reset"],
 ];
 
+/* Object geometry, cached by shape and size rounded to a centimetre.
+ *
+ * Objects are rebuilt every frame and EdgesGeometry is not cheap — it
+ * walks the faces to find the silhouette. A tracked car is the same box
+ * from frame to frame; only its matrix changes.
+ */
+var GEO_CACHE = {};
+
 var STATE_RGB = [0x5b6470, 0xd9483f, 0xc98a1e];   // STATIC, MOVING, MOVABLE
 var SELECT_RGB = 0xffd60a;
 
@@ -85,8 +94,15 @@ function col(rgb01) {
 // one-time setup
 // ─────────────────────────────────────────────────────────────
 function init(width, height) {
-  S.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  S.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  S.renderer = new THREE.WebGLRenderer({
+    antialias: true, alpha: false,
+    // An integrated GPU is the common case for a demo laptop, and this
+    // scene is fill-light and instance-heavy: the discrete card buys
+    // nothing and costs power.
+    powerPreference: "low-power" });
+  // Capped at 1: at 18,000 instances a 2x pixel ratio quadruples the
+  // fragment work for detail nobody reads in a technical diagram.
+  S.renderer.setPixelRatio(1);
   S.renderer.setSize(width, height);
   S.renderer.setClearColor(0x0f1116, 1);
   HOST.appendChild(S.renderer.domElement);
@@ -112,7 +128,36 @@ function init(width, height) {
   buildCamButtons();
   bindPointer();
   observeResize();
+  guardContext();
   animate();
+}
+
+/* A lost context used to leave a white canvas and nothing else.
+ *
+ * The cause is fixed — the renderer no longer churns GPU buffers — but a
+ * driver can still drop the context when the machine is under load, and
+ * recovering is a dozen lines. Without this the tab is simply dead until
+ * a reload.
+ */
+function guardContext() {
+  var el = S.renderer.domElement;
+  el.addEventListener("webglcontextlost", function (e) {
+    e.preventDefault();
+    EMPTY.textContent = "the graphics context was lost — restoring…";
+    EMPTY.style.display = "flex";
+  }, false);
+  el.addEventListener("webglcontextrestored", function () {
+    S.cellMesh = null; S.cellCapacity = 0;
+    S.pointCloud = null; S.pointCapacity = 0;
+    GEO_CACHE = {};
+    EMPTY.style.display = "none";
+    if (S.lastArgs) {
+      buildCells(S.lastArgs); buildObjects(S.lastArgs);
+      buildEgo(S.lastArgs); buildRings(S.lastArgs);
+      buildPoints(S.lastArgs); buildMarker(S.lastArgs);
+    }
+    S.needsRender = true;
+  }, false);
 }
 
 /** Follow the column width.
@@ -325,15 +370,51 @@ function hoverTest(e) {
 // ─────────────────────────────────────────────────────────────
 // cells
 // ─────────────────────────────────────────────────────────────
-function buildCells(args) {
+/*
+ * ONE mesh, reused for the life of the page.
+ *
+ * This used to dispose and rebuild the InstancedMesh every frame. At
+ * 18,000 cells that is 1.15 MB of instance matrices plus 216 kB of
+ * instance colours allocated, uploaded and thrown away several times a
+ * second — enough GPU churn to stall an integrated driver and eventually
+ * lose the WebGL context, which is what turned the canvas white.
+ *
+ * Now the mesh is allocated once at a capacity that only ever grows, and a
+ * frame just overwrites the buffers it already owns and sets `count`.
+ */
+function ensureCellMesh(capacity) {
+  if (S.cellMesh && S.cellCapacity >= capacity) return S.cellMesh;
+
   if (S.cellMesh) {
     S.scene.remove(S.cellMesh);
     S.cellMesh.geometry.dispose();
     S.cellMesh.material.dispose();
-    S.cellMesh = null;
   }
+  // Grow in steps so a scene that drifts a few cells larger each frame
+  // does not reallocate on every one of them.
+  var cap = Math.max(1024, Math.ceil(capacity * 1.35));
+  var mesh = new THREE.InstancedMesh(
+    new THREE.BoxBufferGeometry(1, 1, 1),
+    new THREE.MeshLambertMaterial({}), cap);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  // Touch setColorAt once so three allocates the instanceColor attribute;
+  // after this the array is written directly.
+  mesh.setColorAt(0, new THREE.Color(1, 1, 1));
+  mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+  mesh.frustumCulled = false;
+  S.cellMesh = mesh;
+  S.cellCapacity = cap;
+  S.scene.add(mesh);
+  return mesh;
+}
+
+function buildCells(args) {
   var c = args.cells;
-  if (!c || !c.n) { S.cellXY = null; return; }
+  if (!c || !c.n) {
+    S.cellXY = null;
+    if (S.cellMesh) S.cellMesh.count = 0;
+    return;
+  }
 
   var n = c.n;
   var xy = b64(c.xy, Float32Array);
@@ -344,78 +425,109 @@ function buildCells(args) {
   var ret = b64(c.returns, Uint8Array);
   S.cellXY = xy;
 
-  var pal = args.palettes;
+  var mesh = ensureCellMesh(n);
+  var M = mesh.instanceMatrix.array;      // written directly: setMatrixAt
+  var C = mesh.instanceColor.array;       // and setColorAt are per-call
+  var pal = args.palettes;                // overhead 18,000 times over
   var mode = args.colourBy;
   var hs = args.heightScale;
   var gap = args.showGrid ? 0.88 : 1.0;
   var zlo = c.zRange[0], zhi = Math.max(c.zRange[1], zlo + 0.001);
-
-  var geo = new THREE.BoxBufferGeometry(1, 1, 1);
-  var mat = new THREE.MeshLambertMaterial({ vertexColors: false });
-  var mesh = new THREE.InstancedMesh(geo, mat, n);
-  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-
-  var m = new THREE.Matrix4(), q = new THREE.Quaternion();
-  var pos = new THREE.Vector3(), scl = new THREE.Vector3();
-  var colour = new THREE.Color(), tmp = new THREE.Color();
+  var sizes = c.sizes;
+  var pSem = pal.semantic, pTrav = pal.traversability, pLvl = pal.level;
+  var tmp = new THREE.Color();
 
   for (var i = 0; i < n; i++) {
-    var size = c.sizes[lvl[i]];
-    var base = zcm[2 * i] / 100, top = zcm[2 * i + 1] / 100;
-    // A flat cell is still drawn with a sliver of thickness so it catches
-    // the light and reads as a surface rather than as a z-fighting plane.
-    var h = Math.max((top - base) * hs, 0.02);
-    scl.set(size * gap, h, size * gap);
-    pos.copy(w2t(xy[2 * i], xy[2 * i + 1], base + h / 2));
-    m.compose(pos, q, scl);
-    mesh.setMatrixAt(i, m);
+    var size = sizes[lvl[i]] * gap;
+    var base = zcm[2 * i] * 0.01, top = zcm[2 * i + 1] * 0.01;
+    // A flat cell still gets a sliver of thickness so it catches the light
+    // and reads as a surface rather than as a z-fighting plane.
+    var h = (top - base) * hs;
+    if (h < 0.02) h = 0.02;
 
-    if (mode === "traversability") {
-      colour.setRGB.apply(colour, pal.traversability[trav[i]]);
-    } else if (mode === "resolution level") {
-      colour.setRGB.apply(colour, pal.level[lvl[i]]);
-    } else if (mode === "height") {
-      var t = Math.min(1, Math.max(0, (top - zlo) / (zhi - zlo)));
-      colour.setHSL(0.62 - 0.62 * t, 0.62, 0.30 + 0.28 * t);
-    } else {
-      colour.setRGB.apply(colour, pal.semantic[cls[i]]);
-    }
-    // A cell backed by one return is dimmer than one backed by forty. It
-    // is the same "observed vs barely observed" distinction the inspector
-    // spells out, made visible without a separate layer.
-    var conf = 0.62 + 0.38 * Math.min(1, ret[i] / 12);
-    tmp.copy(colour).multiplyScalar(conf);
-    mesh.setColorAt(i, tmp);
+    // An axis-aligned scale + translation, written straight into the
+    // buffer. compose() through a Quaternion and three Vector3s costs
+    // more than the rest of the loop at this instance count.
+    var o = i * 16;
+    M[o] = size;      M[o + 1] = 0;  M[o + 2] = 0;     M[o + 3] = 0;
+    M[o + 4] = 0;     M[o + 5] = h;  M[o + 6] = 0;     M[o + 7] = 0;
+    M[o + 8] = 0;     M[o + 9] = 0;  M[o + 10] = size; M[o + 11] = 0;
+    M[o + 12] = xy[2 * i];                    // world x  -> three x
+    M[o + 13] = base + h / 2;                 // world z  -> three y
+    M[o + 14] = -xy[2 * i + 1];               // world y  -> three -z
+    M[o + 15] = 1;
+
+    var rgb;
+    if (mode === "traversability") rgb = pTrav[trav[i]];
+    else if (mode === "resolution level") rgb = pLvl[lvl[i]];
+    else if (mode === "height") {
+      var t = (top - zlo) / (zhi - zlo);
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      tmp.setHSL(0.62 - 0.62 * t, 0.62, 0.30 + 0.28 * t);
+      rgb = [tmp.r, tmp.g, tmp.b];
+    } else rgb = pSem[cls[i]];
+
+    // A cell backed by one return is dimmer than one backed by forty: the
+    // same "observed vs barely observed" distinction the inspector spells
+    // out, without a separate layer.
+    var k = ret[i] / 12;
+    var conf = 0.62 + 0.38 * (k > 1 ? 1 : k);
+    var p = i * 3;
+    C[p] = rgb[0] * conf;
+    C[p + 1] = rgb[1] * conf;
+    C[p + 2] = rgb[2] * conf;
   }
+
+  mesh.count = n;
   mesh.instanceMatrix.needsUpdate = true;
-  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  mesh.frustumCulled = false;
-  S.cellMesh = mesh;
-  S.scene.add(mesh);
+  mesh.instanceColor.needsUpdate = true;
 }
+
 
 // ─────────────────────────────────────────────────────────────
 // objects
 // ─────────────────────────────────────────────────────────────
+function cachedGeometry(key, make) {
+  var g = GEO_CACHE[key];
+  if (!g) { g = make(); GEO_CACHE[key] = g; }
+  return g;
+}
+
 function primitiveGeometry(o) {
   var s = o.size;
+  var k = o.primitive + "|" + s.map(function (v) {
+    return Math.round(v * 100);
+  }).join(",");
   if (o.primitive === "pole") {
-    return new THREE.CylinderBufferGeometry(
-      Math.max(s[0], s[1]) / 2, Math.max(s[0], s[1]) / 2, s[2], 10);
+    return cachedGeometry(k, function () {
+      var r = Math.max(s[0], s[1]) / 2;
+      return new THREE.CylinderBufferGeometry(r, r, s[2], 10);
+    });
   }
   if (o.primitive === "person") {
     // A narrow capsule-ish column. r128 has no CapsuleGeometry, and a
     // cylinder with a domed top reads as a person at this scale.
-    return new THREE.CylinderBufferGeometry(
-      Math.max(s[0], s[1]) / 2, Math.max(s[0], s[1]) / 2.4, s[2], 8);
+    return cachedGeometry(k, function () {
+      return new THREE.CylinderBufferGeometry(
+        Math.max(s[0], s[1]) / 2, Math.max(s[0], s[1]) / 2.4, s[2], 8);
+    });
   }
-  return new THREE.BoxBufferGeometry(s[0], s[1], s[2]);
+  return cachedGeometry(k, function () {
+    return new THREE.BoxBufferGeometry(s[0], s[1], s[2]);
+  });
+}
+
+function cachedEdges(geo, key) {
+  return cachedGeometry("E|" + key, function () {
+    return new THREE.EdgesGeometry(geo);
+  });
 }
 
 function buildObjects(args) {
+  // Only the wrappers are dropped; the geometry they point at is cached
+  // and shared, so disposing here would throw away work every frame.
   while (S.objectGroup.children.length) {
-    var c = S.objectGroup.children.pop();
-    S.objectGroup.remove(c);
+    S.objectGroup.remove(S.objectGroup.children[0]);
   }
   S.objects = args.objects || [];
   if (!args.showObjects) return;
@@ -426,6 +538,9 @@ function buildObjects(args) {
     g.userData.label = o.label + "  ·  " + o.stateName;
 
     var geo = primitiveGeometry(o);
+    var gkey = o.primitive + "|" + o.size.map(function (v) {
+      return Math.round(v * 100);
+    }).join(",");
     var rgb = STATE_RGB[o.state];
     var solid = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
       color: rgb, transparent: true,
@@ -435,7 +550,7 @@ function buildObjects(args) {
       depthWrite: false,
     }));
     var wire = new THREE.LineSegments(
-      new THREE.EdgesGeometry(geo),
+      cachedEdges(geo, gkey),
       new THREE.LineBasicMaterial({ color: rgb }));
     g.add(solid, wire);
 
@@ -538,26 +653,40 @@ function buildRings(args) {
 }
 
 function buildPoints(args) {
-  if (S.pointCloud) {
-    S.scene.remove(S.pointCloud);
-    S.pointCloud.geometry.dispose();
-    S.pointCloud.material.dispose();
-    S.pointCloud = null;
-  }
   var p = args.points;
-  if (!p || !p.n) return;
-  var xyz = b64(p.xyz, Float32Array);
-  var arr = new Float32Array(p.n * 3);
-  for (var i = 0; i < p.n; i++) {
-    arr[3 * i] = xyz[3 * i];
-    arr[3 * i + 1] = xyz[3 * i + 2];
-    arr[3 * i + 2] = -xyz[3 * i + 1];
+  var n = (p && p.n) ? p.n : 0;
+  if (!n) {
+    if (S.pointCloud) S.pointCloud.geometry.setDrawRange(0, 0);
+    return;
   }
-  var geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(arr, 3));
-  S.pointCloud = new THREE.Points(geo, new THREE.PointsMaterial({
-    color: 0xeb2b46, size: 0.16, sizeAttenuation: true }));
-  S.scene.add(S.pointCloud);
+  // Same story as the cells: one buffer, grown when it has to be, and
+  // drawn up to `n` rather than reallocated every frame.
+  if (!S.pointCloud || S.pointCapacity < n) {
+    if (S.pointCloud) {
+      S.scene.remove(S.pointCloud);
+      S.pointCloud.geometry.dispose();
+      S.pointCloud.material.dispose();
+    }
+    S.pointCapacity = Math.max(4096, Math.ceil(n * 1.35));
+    var geo = new THREE.BufferGeometry();
+    var attr = new THREE.BufferAttribute(
+      new Float32Array(S.pointCapacity * 3), 3);
+    attr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("position", attr);
+    S.pointCloud = new THREE.Points(geo, new THREE.PointsMaterial({
+      color: 0xeb2b46, size: 0.16, sizeAttenuation: true }));
+    S.pointCloud.frustumCulled = false;
+    S.scene.add(S.pointCloud);
+  }
+  var xyz = b64(p.xyz, Float32Array);
+  var dst = S.pointCloud.geometry.attributes.position.array;
+  for (var i = 0; i < n; i++) {
+    dst[3 * i] = xyz[3 * i];
+    dst[3 * i + 1] = xyz[3 * i + 2];
+    dst[3 * i + 2] = -xyz[3 * i + 1];
+  }
+  S.pointCloud.geometry.attributes.position.needsUpdate = true;
+  S.pointCloud.geometry.setDrawRange(0, n);
 }
 
 function buildMarker(args) {
@@ -691,6 +820,7 @@ function onRender(event) {
 
   EMPTY.style.display = data.cells && data.cells.n ? "none" : "flex";
 
+  var t0 = performance.now();
   buildCells(data);
   buildObjects(data);
   buildEgo(data);
@@ -698,15 +828,25 @@ function onRender(event) {
   buildPoints(data);
   buildMarker(data);
 
+  // Browser-side cost of this update, shown in the HUD. The server half
+  // is in the FOVEA_PROFILE log; between them there is no guessing about
+  // where a slow replay is going.
+  var buildMs = performance.now() - t0;
+  S.buildMs = S.buildMs ? S.buildMs * 0.7 + buildMs * 0.3 : buildMs;
+
   HUD.innerHTML =
     "frame " + (data.frame.index + 1) + " / " + data.frame.count +
     "<br>" + data.cells.n.toLocaleString() + " cells · " +
     data.objects.length + " objects" +
+    "<br>" + S.buildMs.toFixed(0) + " ms to build in the browser" +
     "<br>drag orbit · shift-drag pan · wheel zoom · click to inspect";
 
   S.lastArgs = data;
   S.needsRender = true;
-  Streamlit.setFrameHeight(height);
+  // setFrameHeight is NOT called here. The height only changes when the
+  // column does, and announcing it on every frame makes Streamlit
+  // re-render the component host — roughly doubling the reruns during
+  // playback for a number that did not change.
 }
 
 Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);

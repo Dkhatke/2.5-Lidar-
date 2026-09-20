@@ -166,7 +166,8 @@ def _finest_at(cells: Dict[str, np.ndarray], px: np.ndarray,
     return row, lvl
 
 
-def neighbour_ground_arrays(cells: Dict[str, np.ndarray]
+def neighbour_ground_arrays(cells: Dict[str, np.ndarray],
+                            rows: Optional[np.ndarray] = None
                             ) -> Tuple[np.ndarray, np.ndarray]:
     """Per-cell (max slope in degrees, max step in m) over 4 neighbours.
 
@@ -176,9 +177,11 @@ def neighbour_ground_arrays(cells: Dict[str, np.ndarray]
     5 cm cell here too, and the distance is measured to that cell's actual
     centre rather than assumed to be one cell width.
 
-    It exists because the scene view needs a verdict for every one of
-    ~18,000 cached cells and calling the per-cell path that many times
-    would cost more than the whole render.
+    ``rows`` restricts which cells are ANSWERED for, not which can be a
+    neighbour: the probe still resolves against every cell in the frame,
+    so a cell at the edge of the drawn set still sees the one beyond it.
+    The scene draws 18,000 of ~78,000 cached cells, and computing the
+    other 60,000 was most of its redraw cost.
     ``tests/test_scene_data.py`` asserts the two agree cell by cell, because
     two implementations of one rule is how a dashboard ends up showing two
     different answers to the same question.
@@ -194,15 +197,17 @@ def neighbour_ground_arrays(cells: Dict[str, np.ndarray]
     gz = np.asarray(cells["ground_z"], np.float32)
     lvl = np.asarray(cells["level"], np.int64)
 
-    for level in np.unique(lvl):
-        rows = np.flatnonzero(lvl == level)
+    want = (np.arange(n) if rows is None
+            else np.asarray(rows, np.int64))
+    for level in np.unique(lvl[want]):
+        rows_l = want[lvl[want] == level]
         size = ResolutionLevel.size(int(level))
         for dx, dy in ((size, 0.0), (-size, 0.0), (0.0, size), (0.0, -size)):
-            nrow, nlvl = _finest_at(cells, cx[rows] + dx, cy[rows] + dy)
+            nrow, nlvl = _finest_at(cells, cx[rows_l] + dx, cy[rows_l] + dy)
             ok = nrow >= 0
             if not ok.any():
                 continue
-            src = rows[ok]
+            src = rows_l[ok]
             nb = nrow[ok]
             d = np.full(src.size, size, np.float64)
             other = nlvl[ok] != level
@@ -219,8 +224,8 @@ def neighbour_ground_arrays(cells: Dict[str, np.ndarray]
 
 
 def traversability_arrays(cells: Dict[str, np.ndarray],
-                          profile: Optional[VehicleProfile] = None
-                          ) -> np.ndarray:
+                          profile: Optional[VehicleProfile] = None,
+                          rows: Optional[np.ndarray] = None) -> np.ndarray:
     """The verdict for every cached cell, using the map's own thresholds.
 
     Same rules and same numbers as :func:`derive`; only the shape differs.
@@ -236,7 +241,7 @@ def traversability_arrays(cells: Dict[str, np.ndarray],
     clear = np.asarray(cells["overhead_clearance"], np.float32)
     cls = np.asarray(cells["sem_class"], np.int64)
     npts = np.asarray(cells["n_points"], np.int64)
-    slope, step = neighbour_ground_arrays(cells)
+    slope, step = neighbour_ground_arrays(cells, rows)
 
     blocked = ((obst > profile.max_step_m * 2.0)
                | (slope > profile.max_slope_deg)
