@@ -60,7 +60,10 @@ class PlaybackState:
     n_frames: int
     frame_idx: int = 0
     playing: bool = False
-    speed: str = "1x"
+    #: One second a frame. The demo is watched while someone talks over
+    #: it, and every frame is shown, so slow is the useful default; the
+    #: selector goes up to 4x for anyone who wants to skim.
+    speed: str = "0.1x"
     loop: bool = True
     #: When the current playing stretch began, and the frame it began on.
     #: The displayed frame is computed FROM THE CLOCK rather than by
@@ -359,29 +362,37 @@ class PlaybackController:
         return s.frame_idx
 
     def speed_selector(self, label: str = "Replay speed") -> str:
+        """The replay-speed control, bound to the shared playback state.
+
+        It goes through the same two-way sync as the scenario selector,
+        and for the same reason: writing the shared value into the widget
+        slot before drawing it lands on top of the choice the user just
+        made — Streamlit has already stored that choice by the time the
+        script runs — so the control silently snapped back to its previous
+        value every time.
+        """
         import streamlit as st
+        from adaptive_lidar.visualization import session as _sess
+
         s = self.state
-        opts = list(SPEEDS)
         before = s.speed
-        # Same reason as the timeline: the shared state is the truth, and
-        # the per-tab widget is synced to it before it is drawn.
         sk = f"{self.key}_speed"
-        if st.session_state.get(sk) != s.speed:
-            st.session_state[sk] = s.speed
-        chosen = st.selectbox(label, opts, key=sk,
-                              help="How long each frame is held for. It "
-                                   "changes nothing the pipeline measured. "
-                                   "One frame is shown per redraw, so a "
-                                   "setting faster than the redraw simply "
-                                   "plays at the redraw rate rather than "
-                                   "skipping frames. Set FOVEA_PROFILE=1 "
-                                   "to print the real per-redraw cost.")
+        _sess.sync(sk, _sess.SPEED_KEY, s.speed)
+        chosen = st.selectbox(
+            label, list(SPEEDS), key=sk,
+            help="How long each frame is held for. It changes nothing the "
+                 "pipeline measured. One frame is shown per redraw, so a "
+                 "setting faster than the redraw plays at the redraw rate "
+                 "rather than skipping frames. Set FOVEA_PROFILE=1 to "
+                 "print the real per-redraw cost.")
         s.speed = chosen
-        if chosen != before and s.playing:
-            # The interval feeds run_every, which is set on the enclosing
-            # script run, so the new speed needs an app rerun to take hold.
+        if chosen != before:
+            # The interval feeds run_every, which is fixed when the
+            # fragment is decorated, so a new speed only takes hold on an
+            # app rerun.
             s.started_at = None
-            st.rerun()
+            PROFILE.log("speed", f"{self.key} -> {chosen}")
+            _sess.refresh("app")
         return chosen
 
     def tick_if_playing(self, now: Optional[float] = None) -> bool:

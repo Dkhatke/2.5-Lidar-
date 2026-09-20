@@ -1406,3 +1406,23 @@ A `0.1x` replay speed was added at the same time: a second per frame, slow
 enough to talk over, which is what a walk-through actually needs.
 
 Tests: 213 → **231**.
+
+### Follow-up: the replay-speed control
+
+Same fault as the scenario dropdown, in the one place it had not been
+fixed: `speed_selector` wrote the shared value into the widget slot before
+drawing it, which lands on top of the choice Streamlit has already stored.
+The control snapped back to its previous value every time — "it always
+stays as 1x even though I try to change it".
+
+It now goes through the same `session.sync`, and the default is **0.1x**:
+one second a frame, slow enough to talk over while pointing at things,
+which is what a walk-through in front of judges needs. The fast end still
+goes to 4x, bounded by the redraw.
+
+The regression test drives the real `speed_selector` through a Streamlit
+stub that reproduces the write-before-run behaviour exactly, rather than
+asserting on the source — the choice is kept, it survives a redraw, it
+reruns the app so `run_every` is re-armed, and both tabs see one speed.
+
+Tests: 231 → **239**.

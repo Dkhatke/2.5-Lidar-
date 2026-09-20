@@ -28,6 +28,7 @@ PLAYBACK_STATE_KEY = "_fovea_playback"
 #: widgets with the same key even in different tabs, so each tab keys its
 #: own control and both :func:`pull` from and :func:`push` to these.
 SCENARIO_KEY = "fovea_scenario"
+SPEED_KEY = "fovea_speed"
 N_FRAMES_KEY = "fovea_n_frames"
 GATE_KEY = "fovea_gate"
 

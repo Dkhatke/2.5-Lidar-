@@ -202,7 +202,9 @@ def test_the_interval_is_respected_at_every_speed(speed):
 
 
 def test_scrubbing_restarts_the_interval_from_where_it_was_dropped():
-    c = PlaybackController(state=PlaybackState(100, playing=True))
+    # Speed pinned: this is about scrubbing, not about what the default is.
+    c = PlaybackController(state=PlaybackState(100, playing=True,
+                                               speed="1x"))
     c.tick_if_playing(now=10.0)
     c.tick_if_playing(now=10.5)
     assert c.state.frame_idx == 1
@@ -282,3 +284,91 @@ def test_fragment_support_is_probed_not_assumed():
     """The binding must check the installed Streamlit rather than trust it."""
     assert isinstance(PlaybackController.supports_fragments(), bool)
     assert isinstance(PlaybackController.supports_fragment_scope(), bool)
+
+
+# ════════════════════════════════════════════════════════════
+# The speed control
+# ════════════════════════════════════════════════════════════
+def test_the_default_is_the_slow_walk_through_speed():
+    """One second a frame. The demo is narrated while it plays."""
+    s = PlaybackState(24)
+    assert s.speed == "0.1x"
+    assert s.interval_s() == pytest.approx(1.0)
+
+
+class _FakeStreamlit:
+    """Enough of Streamlit to drive `speed_selector` for real.
+
+    A keyed widget reads its value out of session state, and Streamlit
+    puts a changed value there BEFORE the script runs — which is the whole
+    reason the control used to snap back. The stub reproduces exactly
+    that, so the test exercises the real binding rather than a paraphrase.
+    """
+
+    def __init__(self):
+        self.session_state = {}
+        self.reruns = []
+
+    def selectbox(self, label, options, key=None, help=None, index=None):
+        return self.session_state[key]
+
+    def rerun(self, scope="app"):
+        self.reruns.append(scope)
+
+
+@pytest.fixture
+def fake_st(monkeypatch):
+    import sys
+    st = _FakeStreamlit()
+    monkeypatch.setitem(sys.modules, "streamlit", st)
+    return st
+
+
+def test_the_speed_control_keeps_the_users_choice(fake_st):
+    """The reported bug: "I'm not able to change the speed, it stays 1x".
+
+    Writing the shared value into the widget slot before drawing lands on
+    top of the choice Streamlit has already stored — the same fault that
+    made every scenario but the default unreachable.
+    """
+    c = PlaybackController(key="live", state=PlaybackState(24))
+    assert c.speed_selector() == "0.1x"          # the default
+
+    fake_st.session_state["live_speed"] = "1x"   # the user picks 1x
+    assert c.speed_selector() == "1x"
+    assert c.state.speed == "1x"
+
+    # ...and a redraw does not revert it
+    assert c.speed_selector() == "1x"
+    assert c.state.interval_s() == pytest.approx(0.1)
+
+
+def test_changing_speed_reruns_the_app_so_the_timer_is_re_armed(fake_st):
+    """`run_every` is fixed when the fragment is decorated."""
+    c = PlaybackController(key="live", state=PlaybackState(24, playing=True))
+    c.speed_selector()
+    fake_st.reruns.clear()
+    fake_st.session_state["live_speed"] = "0.5x"
+    c.speed_selector()
+    assert fake_st.reruns == ["app"]
+    assert c.state.started_at is None            # the clock restarts
+
+
+def test_both_tabs_see_one_speed(fake_st):
+    """Set it in one view, it holds in the other."""
+    state = PlaybackState(24)
+    live = PlaybackController(key="live", state=state)
+    scene = PlaybackController(key="scene", state=state)
+    live.speed_selector()
+    scene.speed_selector()
+
+    fake_st.session_state["scene_speed"] = "0.25x"
+    scene.speed_selector()
+    assert live.speed_selector() == "0.25x"
+    assert state.speed == "0.25x"
+
+
+@pytest.mark.parametrize("speed,seconds", [
+    ("0.1x", 1.0), ("0.25x", 0.4), ("0.5x", 0.2), ("1x", 0.1)])
+def test_each_speed_maps_to_a_frame_duration(speed, seconds):
+    assert PlaybackState(24, speed=speed).interval_s() ==         pytest.approx(max(seconds, MIN_INTERVAL_S))
