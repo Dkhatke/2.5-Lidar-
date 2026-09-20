@@ -136,6 +136,123 @@ def derive(cell: Dict[str, Any], cells: Dict[str, np.ndarray],
                    ["within every limit for the wheeled profile"], len(nb))
 
 
+def _finest_at(cells: Dict[str, np.ndarray], px: np.ndarray,
+               py: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorised ``find_cell_row`` for many probe points at once.
+
+    Same rule, same level order: the finest cell containing the point wins.
+    Rows come back as -1 where nothing contains the probe.
+    """
+    n = px.size
+    row = np.full(n, -1, np.int64)
+    lvl = np.full(n, -1, np.int64)
+    for level in range(ResolutionLevel.N_LEVELS):
+        todo = np.flatnonzero(row < 0)
+        if todo.size == 0:
+            break
+        keys, krows = SEL._level_index(cells, level)
+        if keys.size == 0:
+            continue
+        size = ResolutionLevel.size(level)
+        want = SEL._pack(np.floor(px[todo] / size).astype(np.int64),
+                         np.floor(py[todo] / size).astype(np.int64))
+        j = np.searchsorted(keys, want)
+        ok = j < keys.size
+        j = np.clip(j, 0, keys.size - 1)
+        ok &= keys[j] == want
+        hit = todo[ok]
+        row[hit] = krows[j[ok]]
+        lvl[hit] = level
+    return row, lvl
+
+
+def neighbour_ground_arrays(cells: Dict[str, np.ndarray]
+                            ) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-cell (max slope in degrees, max step in m) over 4 neighbours.
+
+    The vectorised twin of :func:`_neighbour_ground`, and deliberately an
+    exact one: a neighbour probe resolves through the same finest-first
+    lookup, so a 20 cm cell whose neighbour was refined to 5 cm finds the
+    5 cm cell here too, and the distance is measured to that cell's actual
+    centre rather than assumed to be one cell width.
+
+    It exists because the scene view needs a verdict for every one of
+    ~18,000 cached cells and calling the per-cell path that many times
+    would cost more than the whole render.
+    ``tests/test_scene_data.py`` asserts the two agree cell by cell, because
+    two implementations of one rule is how a dashboard ends up showing two
+    different answers to the same question.
+    """
+    n = len(cells.get("cx", ()))
+    slope = np.zeros(n, np.float32)
+    step = np.zeros(n, np.float32)
+    if n == 0:
+        return slope, step
+
+    cx = np.asarray(cells["cx"], np.float64)
+    cy = np.asarray(cells["cy"], np.float64)
+    gz = np.asarray(cells["ground_z"], np.float32)
+    lvl = np.asarray(cells["level"], np.int64)
+
+    for level in np.unique(lvl):
+        rows = np.flatnonzero(lvl == level)
+        size = ResolutionLevel.size(int(level))
+        for dx, dy in ((size, 0.0), (-size, 0.0), (0.0, size), (0.0, -size)):
+            nrow, nlvl = _finest_at(cells, cx[rows] + dx, cy[rows] + dy)
+            ok = nrow >= 0
+            if not ok.any():
+                continue
+            src = rows[ok]
+            nb = nrow[ok]
+            d = np.full(src.size, size, np.float64)
+            other = nlvl[ok] != level
+            if other.any():
+                d[other] = np.maximum(
+                    np.hypot(cx[nb[other]] - cx[src[other]],
+                             cy[nb[other]] - cy[src[other]]), 1e-3)
+            diff = np.abs(gz[nb] - gz[src]).astype(np.float32)
+            step[src] = np.maximum(step[src], diff)
+            slope[src] = np.maximum(
+                slope[src],
+                np.degrees(np.arctan(diff / d)).astype(np.float32))
+    return slope, step
+
+
+def traversability_arrays(cells: Dict[str, np.ndarray],
+                          profile: Optional[VehicleProfile] = None
+                          ) -> np.ndarray:
+    """The verdict for every cached cell, using the map's own thresholds.
+
+    Same rules and same numbers as :func:`derive`; only the shape differs.
+    """
+    profile = profile or VehicleProfile.wheeled()
+    n = len(cells.get("cx", ()))
+    if n == 0:
+        return np.zeros(0, np.int8)
+
+    gz = np.asarray(cells["ground_z"], np.float32)
+    obst = np.maximum(np.asarray(cells["z_max"], np.float32) - gz, 0.0)
+    rough = np.sqrt(np.maximum(np.asarray(cells["z_var"], np.float32), 0.0))
+    clear = np.asarray(cells["overhead_clearance"], np.float32)
+    cls = np.asarray(cells["sem_class"], np.int64)
+    npts = np.asarray(cells["n_points"], np.int64)
+    slope, step = neighbour_ground_arrays(cells)
+
+    blocked = ((obst > profile.max_step_m * 2.0)
+               | (slope > profile.max_slope_deg)
+               | (step > profile.max_step_m)
+               | (clear < profile.min_clearance_m)
+               | np.isin(cls, (2, 3, 4)))
+    caution = ((rough > profile.max_roughness)
+               | (slope > profile.max_slope_deg * 0.6)
+               | (step > profile.max_step_m * 0.6)
+               | (cls == 1) | (cls == 5)
+               | (npts < 2))
+    return np.where(blocked, Traversability.BLOCKED,
+                    np.where(caution, Traversability.CAUTION,
+                             Traversability.DRIVABLE)).astype(np.int8)
+
+
 def cell_morton(cell: Dict[str, Any]) -> int:
     """The cell's address in the hierarchy — its Morton code at its level."""
     s = ResolutionLevel.size(int(cell["level"]))
@@ -384,8 +501,8 @@ def _fmt_raw(v: Any) -> str:
 # ════════════════════════════════════════════════════════════
 # The object inspector
 # ════════════════════════════════════════════════════════════
-def render_object(obj: Dict[str, Any], *, ego_xy, has_cell: bool = True
-                  ) -> bool:
+def render_object(obj: Dict[str, Any], *, ego_xy, has_cell: bool = True,
+                  key: str = "obj_inspect_cell") -> bool:
     """Draw a tracked object. Returns True if "inspect cell" was pressed."""
     import streamlit as st
 
@@ -417,8 +534,10 @@ def render_object(obj: Dict[str, Any], *, ego_xy, has_cell: bool = True
                "near-zero RELATIVE speed and is still correctly MOVING; a "
                "parked one is MOVABLE_BUT_STATIONARY rather than STATIC, "
                "because it may drive off.")
+    # `key` is a parameter because both visualisation tabs render this
+    # panel, and Streamlit refuses two widgets with the same key.
     return st.button("Inspect underlying cell", width="stretch",
-                     key="obj_inspect_cell", disabled=not has_cell,
+                     key=key, disabled=not has_cell,
                      help="Switch to the map cell nearest this object's "
                           "centroid." if has_cell else
                           "No mapped surface near this centroid.")

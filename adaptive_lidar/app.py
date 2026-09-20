@@ -3,15 +3,18 @@ app.py — FOVEA, the dashboard (M5).
 
     streamlit run app.py
 
-Three tabs, in the order a reader needs them:
+Four tabs, in the order a reader needs them:
 
-  1. **Live Demo** — the scene, driveable and clickable. This is the default
-     because the engineering dashboard is the answer to the second question,
-     not the first.
-  2. **Research & evaluation** — the equal-memory comparison, the
+  1. **Live demo** — the adaptive map, driveable and clickable. The default,
+     because the engineering dashboard answers the second question a
+     reviewer has, not the first.
+  2. **Scene demo** — the same run drawn as the physical environment the
+     map is a map of. Shares the frame, the playback state and the
+     selection with the Live demo; runs no perception of its own.
+  3. **Research & evaluation** — the equal-memory comparison, the
      range-stratified accuracy tables, per-stage latency, the object table.
      Every number here was measured in this session.
-  3. **Debug & cell inspector** — the raw query path against the live map,
+  4. **Debug & cell inspector** — the raw query path against the live map,
      kept for development.
 
 Honesty rules, unchanged from the first version and now stated on screen:
@@ -258,15 +261,24 @@ if R_["backend"] == "oracle":
 # ════════════════════════════════════════════════════════════
 # Tabs — Live Demo first, deliberately
 # ════════════════════════════════════════════════════════════
-tab_live, tab_research, tab_debug = st.tabs(
-    ["▶ Live demo", "Research & evaluation", "Debug & cell inspector"])
+tab_live, tab_scene, tab_research, tab_debug = st.tabs(
+    ["▶ Live demo", "Scene demo", "Research & evaluation",
+     "Debug & cell inspector"])
 
 # ── 1. LIVE DEMO ─────────────────────────────────────────────
 with tab_live:
     from adaptive_lidar.visualization.live_demo import render_live_demo
     render_live_demo(precompute_drive)
 
-# ── 2. RESEARCH & EVALUATION ─────────────────────────────────
+# ── 2. SCENE DEMO ────────────────────────────────────────────
+# The same run, drawn as the physical environment it is a map of. It shares
+# the frame, the playback state and the selection with the Live demo, and
+# runs nothing of its own — no second pipeline, no second inspector.
+with tab_scene:
+    from adaptive_lidar.visualization.scene_demo import render_scene_demo
+    render_scene_demo(precompute_drive)
+
+# ── 3. RESEARCH & EVALUATION ─────────────────────────────────
 with tab_research:
     a = R_["arrays"]
     amap = R_["amap"]
@@ -524,7 +536,7 @@ with tab_research:
                "measured is reported rather than rounded towards the target. "
                "See docs/RESULTS.md.")
 
-# ── 3. DEBUG & CELL INSPECTOR ────────────────────────────────
+# ── 4. DEBUG & CELL INSPECTOR ────────────────────────────────
 with tab_debug:
     st.markdown("#### Query the live map directly")
     st.caption(

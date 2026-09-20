@@ -31,6 +31,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
 
+from adaptive_lidar.visualization import profile as PROFILE
+
 #: Replay speed multipliers offered in the transport.
 SPEEDS: Dict[str, float] = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0,
                             "2x": 2.0, "4x": 4.0}
@@ -57,10 +59,13 @@ class PlaybackState:
     playing: bool = False
     speed: str = "1x"
     loop: bool = True
-    #: Wall clock of the last timer-driven advance. Lives on the state
-    #: rather than the controller because the controller is rebuilt on every
-    #: script run while the state persists in session state.
-    last_tick: Optional[float] = None
+    #: When the current playing stretch began, and the frame it began on.
+    #: The displayed frame is computed FROM THE CLOCK rather than by
+    #: counting redraws — see :meth:`frame_at`. Both live on the state
+    #: because the controller is rebuilt on every script run while the
+    #: state persists in session state.
+    started_at: Optional[float] = None
+    start_frame: int = 0
 
     def __post_init__(self) -> None:
         self.n_frames = max(int(self.n_frames), 0)
@@ -84,24 +89,29 @@ class PlaybackState:
     def seek(self, i: int) -> None:
         """Scrub. Scrubbing does NOT pause: the timeline is a live position."""
         self.frame_idx = self._clamp(i)
+        self.started_at = None          # the clock restarts from here
 
     def next(self) -> None:
         """One frame forward. Stepping pauses — it is for pointing at things."""
         self.playing = False
         self.frame_idx = self._wrap(self.frame_idx + 1)
+        self.started_at = None
 
     def previous(self) -> None:
         self.playing = False
         self.frame_idx = self._wrap(self.frame_idx - 1)
+        self.started_at = None
 
     def reset(self) -> None:
         self.playing = False
         self.frame_idx = 0
+        self.started_at = None
 
     def toggle(self) -> None:
         if not self.playing and self.at_end and not self.loop:
             self.frame_idx = 0          # replay rather than sit at the end
         self.playing = not self.playing
+        self.started_at = None
 
     def tick(self) -> None:
         """Advance because the timer fired. A no-op when paused.
@@ -116,6 +126,25 @@ class PlaybackState:
             self.playing = False
             return
         self.frame_idx = self._wrap(self.frame_idx + 1)
+
+    def start_clock(self, now: float) -> None:
+        self.started_at = float(now)
+        self.start_frame = self.frame_idx
+
+    def frame_at(self, now: float) -> int:
+        """The frame the CLOCK says should be showing.
+
+        Playback is a function of elapsed time, not of how many times
+        something redrew. Two tabs each hold a transport bound to this one
+        state, and each re-renders at its own speed; if every redraw
+        advanced the index, the run would play at the sum of their rates
+        and neither would show a steady 10 Hz scene. Deriving the index
+        from the clock makes the extra renderer free.
+        """
+        if self.started_at is None or self.n_frames <= 0:
+            return self.frame_idx
+        k = int((float(now) - self.started_at) / self.interval_s())
+        return self._wrap(self.start_frame + max(k, 0))
 
     def _wrap(self, i: int) -> int:
         if self.n_frames <= 0:
@@ -155,9 +184,17 @@ class PlaybackController:
 
     # ── session-state persistence ────────────────────────────
     @classmethod
-    def bind(cls, n_frames: int, key: str = "pb") -> "PlaybackController":
+    def bind(cls, n_frames: int, key: str = "pb",
+             state_key: Optional[str] = None) -> "PlaybackController":
+        """Bind widgets keyed by ``key`` to the state under ``state_key``.
+
+        The two are separate so that two tabs can each draw a transport —
+        Streamlit widgets cannot share a key — while both drive ONE
+        playback state. Without that split, switching tab would jump to a
+        different frame, which is the opposite of sharing.
+        """
         import streamlit as st
-        st_key = f"_{key}_state"
+        st_key = state_key or f"_{key}_state"
         s = st.session_state.get(st_key)
         if not isinstance(s, PlaybackState):
             s = PlaybackState(n_frames)
@@ -239,7 +276,7 @@ class PlaybackController:
                          type="primary" if not s.playing else "secondary",
                          disabled=s.n_frames <= 1):
                 s.toggle()
-                s.last_tick = None
+                PROFILE.log("toggle", f"{self.key} playing={s.playing}")
                 _rerun("app")          # the timer schedule changes
         with c_next:
             if st.button("⏭ Next", key=f"{self.key}_next", width="stretch",
@@ -254,20 +291,34 @@ class PlaybackController:
                 _rerun("app")          # reset pauses, so the timer stops
 
         with c_bar:
-            if s.n_frames > 1:
-                # Deliberately KEYLESS. A keyed slider latches its value in
-                # session state and would then ignore `value` on every later
-                # run, so the handle would sit still while playback advanced
-                # underneath it. Without a key the passed value wins, and a
-                # drag still returns the dragged position on its own rerun.
-                i = st.slider("Timeline", 0, s.last, s.frame_idx,
+            if s.n_frames <= 1:
+                st.caption("Single frame — nothing to play.")
+            elif s.playing:
+                # While playing the timeline is a READOUT, not a widget.
+                #
+                # A keyed slider has to be written on every redraw to make
+                # the handle follow the clock, Streamlit treats each of
+                # those writes as a change and fires `on_change`, and with
+                # two tabs each holding a transport bound to one state the
+                # two sliders then scrub each other backwards several times
+                # a second. A progress bar has no widget state to fight
+                # over, and the handle still shows the position.
+                frac = (s.frame_idx / max(s.last, 1)) * 100.0
+                st.markdown(
+                    f'<div style="height:6px;border-radius:3px;'
+                    f'background:#e6e7ea;overflow:hidden;margin:.55rem 0">'
+                    f'<div style="height:100%;width:{frac:.1f}%;'
+                    f'background:#C2410C"></div></div>',
+                    unsafe_allow_html=True)
+            else:
+                bar = f"{self.key}_bar"
+                st.session_state[bar] = s.frame_idx
+                i = st.slider("Timeline", 0, s.last, key=bar,
                               label_visibility="collapsed")
                 if i != s.frame_idx:
                     s.seek(i)
                     if on_change is not None:
                         on_change()
-            else:
-                st.caption("Single frame — nothing to play.")
 
         with c_read:
             st.markdown(
@@ -287,8 +338,12 @@ class PlaybackController:
         s = self.state
         opts = list(SPEEDS)
         before = s.speed
-        chosen = st.selectbox(label, opts, index=opts.index(s.speed),
-                              key=f"{self.key}_speed",
+        # Same reason as the timeline: the shared state is the truth, and
+        # the per-tab widget is synced to it before it is drawn.
+        sk = f"{self.key}_speed"
+        if st.session_state.get(sk) != s.speed:
+            st.session_state[sk] = s.speed
+        chosen = st.selectbox(label, opts, key=sk,
                               help="Playback rate only. It changes nothing "
                                    "the pipeline measured. The achieved "
                                    "rate is bounded by the redraw: ~95 ms "
@@ -302,29 +357,33 @@ class PlaybackController:
         if chosen != before and s.playing:
             # The interval feeds run_every, which is set on the enclosing
             # script run, so the new speed needs an app rerun to take hold.
-            s.last_tick = None
+            s.started_at = None
             st.rerun()
         return chosen
 
     def tick_if_playing(self, now: Optional[float] = None) -> bool:
         """Called at the END of the fragment body, once it has drawn.
 
-        Gated on wall clock rather than simply advancing, because a fragment
-        reruns for two reasons — the ``run_every`` timer, and a widget inside
-        it changing — and Streamlit does not say which. Without the gate,
-        dragging the timeline during playback would also steal a frame.
+        Sets the frame from the clock rather than incrementing it. That is
+        what makes a second view of the same run free: a fragment reruns
+        both on its ``run_every`` timer and on any widget inside it, two
+        tabs each hold a transport, and none of that may change how fast
+        the scene plays.
 
         Returns True if the frame index moved.
         """
         import time as _time
         s = self.state
         if not s.playing or s.n_frames <= 1:
-            s.last_tick = None
+            s.started_at = None
             return False
         t = _time.monotonic() if now is None else float(now)
-        if s.last_tick is not None and (t - s.last_tick) < 0.75 * s.interval_s():
+        if s.started_at is None:
+            PROFILE.log("clock", f"{self.key} restart at {s.frame_idx}")
+            s.start_clock(t)
             return False
-        s.last_tick = t
         before = s.frame_idx
-        s.tick()
+        s.frame_idx = s.frame_at(t)
+        if not s.loop and s.frame_idx >= s.last:
+            s.playing = False
         return s.frame_idx != before

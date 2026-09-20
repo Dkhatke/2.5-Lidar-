@@ -1137,3 +1137,177 @@ the mapping code for it. The visualisation layer is split so that a Three.js
 renderer could replace `interactive_map.render_canvas` without touching
 selection, the inspector or the transport, because all three go through
 `ViewTransform` rather than through pixels.
+
+## PHASE 13 — SCENE DEMO ✅
+
+A second visualisation tab, beside the Live demo and sharing its run: the
+same 2.5D map drawn as the physical environment it is a map of.
+
+```
+LIVE DEMO   what does the adaptive map look like?
+SCENE DEMO  what is that map a map OF?
+RESEARCH    how well does the system perform?
+```
+
+Nothing new is computed. Cells give the surfaces and their heights, tracked
+instances give the objects, the stored pose gives the vehicle. No second
+pipeline, no second inspector, no invented geometry.
+
+### The renderer
+
+three.js r128 (MIT), vendored at
+`visualization/scene_frontend/vendor/three.min.js`, declared as a Streamlit
+component from four static files with no build step. Nothing is fetched at
+run time, which is the same constraint the rest of the project runs under.
+The Streamlit bridge is 40 lines written here rather than the official
+React build, because the protocol the page needs is three `postMessage`
+calls.
+
+Orbit / pan / zoom are hand-written pointer handlers — about sixty lines
+against another vendored file, and it keeps click-versus-drag under our
+own control.
+
+### Pipeline data to geometry
+
+`visualization/scene_data.py` is the whole adapter, and the rule it exists
+to enforce is that **no pipeline logic lives in JavaScript**. The browser
+receives positions, sizes and colours; it decides nothing.
+
+| drawn | from | note |
+|---|---|---|
+| cell footprint | `ResolutionLevel.size(level)` | 1:1, never scaled |
+| cell base / top | `ground_z` / `z_max` | clamped only when `z_max < ground_z`, which the map allows |
+| cell colour | `render.CLASS_COLOURS` etc. | the 2D map's own palettes, passed through |
+| verdict | `inspector.traversability_arrays` | the map's own thresholds |
+| object box | `Instance.extent` | padded to a class floor when smaller, and **flagged** |
+| ego | the stored pose | 4.6 × 2.0 × 1.5 m, sensor at the configured mount height |
+| rings | `RANGE_BANDS` | 10 / 30 / 60 / 100 m — the evaluation's own bands |
+
+Cells go over the wire as base64 of raw buffers, 16 bytes each: centre as
+float32 (the click path round-trips through it into the real cell lookup,
+where a centimetre of drift would pick the neighbouring 5 cm cell), height
+quantised to centimetres, and level/class/verdict/returns as bytes.
+
+```
+Light     build  61 ms   payload 188 kB   8,000 cells
+Balanced  build  55 ms   payload 396 kB  18,000 cells
+Full      build  59 ms   payload 959 kB  45,000 cells
+```
+
+The cap is nearest-first and whatever is dropped is counted under the
+canvas, never quietly thinned.
+
+### Two honesty problems this view created
+
+**Object boxes are not measurements.** A tracked instance's `extent` is the
+bounding box of the returns, and a LiDAR sees one side of a car, so the box
+is routinely too small to read as a car. Enlarging it silently would be
+presenting drawn geometry as sensor output. Instead a padded box is drawn
+fainter, carries `geomSource: "padded"`, and the inspector says:
+
+> **Visualisation geometry.** The sensor measured 0.90 × 0.40 × 0.50 m —
+> the returns from one side of the object. The scene draws 3.80 × 1.70 ×
+> 1.40 m, raised to this class's floor so the object is visible at all.
+
+On one frame of `mixed_urban`, **18 of 27** boxes are padded.
+
+**Ground-class tracks are not objects.** The tracker emits instances the
+classifier called `ground_drivable` — an 8 × 1 × 0.16 m slab of road. In
+the 2D map that is a thin outline. In a 3D scene it becomes a solid lying
+across the road that (a) reads as something that is not there and (b) sits
+between the cursor and the cells, swallowing the cell clicks this tab
+exists for. They are counted under the canvas (`3 ground-class tracks (not
+boxed)`) and still listed in the Live demo's object table.
+
+### Selection: one source of truth
+
+The renderer reports a world point and, if it hit one, a track id. It never
+reports a cell — resolving the point is `selection.py`'s job against the
+cached frame, so the scene and the 2D map cannot disagree about what is
+under a place. The inspector is `inspector.render_cell`, the same function
+the Live demo calls, with one extra line above it tying the solid shape
+back to the record:
+
+> **20 cm cell** · ground_drivable · 26 return(s)
+> the shape you clicked is one row of the 2.5D map, drawn from ground
+> −0.08 m to top −0.06 m
+
+Verified in the browser: clicking a surface selected the cell at
+(−4.900, 0.500), 20 cm, level 2, Morton code 114532460590 = the level-0
+code >> 4, DRIVABLE; switching to the Live demo showed the same cell
+already selected.
+
+### Vectorised traversability, and a drift caught by testing it
+
+The scene needs a verdict for ~18,000 cells, which the per-cell
+`inspector.derive` cannot supply at that rate.
+`inspector.traversability_arrays` is the vectorised twin — and writing the
+test that the two agree found that they did not: `derive` resolves a
+neighbour probe through the finest-first lookup (so a 20 cm cell whose
+neighbour was refined to 5 cm finds the 5 cm cell and measures the real
+distance to its centre), while the first vectorised version only looked at
+the same level. Fixed to mirror it exactly.
+
+```
+per-cell vs vectorised verdict on a real frame: 370/370 agree
+```
+
+### Playback: shared, and clock-driven
+
+Both tabs bind to one `PlaybackState`; only the widget keys are per-tab,
+because Streamlit refuses two widgets with the same key. Three bugs came
+out of that, each invisible from the outside:
+
+1. **Two tickers, double speed.** Each tab's fragment advanced the shared
+   index on every redraw, so the run played at the sum of their render
+   rates. The frame is now a function of elapsed time
+   (`PlaybackState.frame_at`), which makes the second renderer free.
+2. **The slider scrubbing itself.** Streamlit fires a slider's `on_change`
+   for the value the *server* writes, not only for a drag. Syncing the
+   handle to the clock therefore looked like a scrub several times a
+   second, and each one restarted playback from a stale position. While
+   playing, the timeline is now a read-only progress bar; the slider comes
+   back when paused.
+3. **Reruns queuing.** `run_every` shorter than the redraw piles runs up
+   behind each other and the browser gets payloads out of order. Each tab
+   now schedules no faster than it can draw — 0.15 s for the 2D canvas,
+   0.40 s for the scene, both measured.
+
+Play/pause reruns the *app* rather than the fragment, because `run_every`
+is fixed when the fragment is decorated; everything else stays
+fragment-scoped. Selection changes are app-scoped too, so a cell picked in
+one tab is already selected when the other is opened.
+
+### Layout bugs found by looking at the page
+
+* the canvas kept its size from the last Streamlit render, so resizing the
+  browser left the scene stretched in a corner. A `ResizeObserver` now
+  follows the column.
+* the component sizes its iframe from the image's natural height, leaving
+  a dead band under the 2D canvas. The aspect ratio is known at render
+  time, so it is pinned.
+* the default camera started inside the buildings; it now opens above and
+  behind the vehicle.
+* labels overlapped into an unreadable stack; they are now capped at 12,
+  movers and non-ground classes first, and skipped when they would collide.
+
+### Tests
+
+167 → **213**, all passing. `tests/test_scene_data.py` (46) covers cell
+centres surviving the wire exactly and still resolving to their own cell,
+footprints from the level table, heights from `ground_z`/`z_max`, the
+clamp, the nearest-first cap and its count, primitive choice, padded-box
+flagging and that padding grows upward from where the points were, world
+anchoring (same cells, two ego poses, identical drawn coordinates), JSON
+serialisability, rings equal to `RANGE_BANDS`, palettes equal to the 2D
+renderer's, and the ground-class exclusion. `test_playback_controller.py`
+gained the clock-driven and two-renderer properties.
+
+### Not done
+
+* **Full point cloud.** Only the dynamic overlay is cached per frame, so
+  "Moving points" draws that and says so. Caching every point for every
+  frame would cost more than the whole rest of the cache.
+* **Both tabs animate when playing, including the hidden one.** Streamlit
+  cannot tell which tab is visible. The clock-driven frame keeps that
+  correct, but it does cost a redraw the viewer never sees.

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>FOVEA scene</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; overflow: hidden; background: #0f1116;
+      font-family: "Source Sans Pro", -apple-system, system-ui, sans-serif;
+    }
+    #wrap { position: relative; width: 100%; height: 100%; }
+    canvas { display: block; outline: none; }
+
+    /* Overlays are absolutely positioned over the canvas rather than being
+       Streamlit widgets: one DOM node per cell would be tens of thousands
+       of elements, and the camera must not cost a server round trip. */
+    #labels { position: absolute; inset: 0; pointer-events: none; }
+    .lbl {
+      position: absolute; transform: translate(-50%, -100%);
+      font-size: 10.5px; letter-spacing: .02em; color: #dfe3ea;
+      background: rgba(16, 18, 24, .72); border: 1px solid rgba(255,255,255,.10);
+      border-radius: 3px; padding: 1px 5px; white-space: nowrap;
+    }
+    .lbl.moving { border-color: #d9483f; color: #ffd9d5; }
+    .ring-lbl {
+      position: absolute; transform: translate(-50%, -50%);
+      font-size: 9.5px; color: #6f7784; letter-spacing: .06em;
+    }
+
+    #cams {
+      position: absolute; top: 10px; left: 10px; display: flex; gap: 4px;
+    }
+    #cams button {
+      font: inherit; font-size: 11px; letter-spacing: .04em;
+      padding: 3px 9px; border-radius: 4px; cursor: pointer;
+      color: #b9c0cb; background: rgba(28, 31, 40, .86);
+      border: 1px solid rgba(255, 255, 255, .10);
+    }
+    #cams button:hover { color: #fff; border-color: rgba(255,255,255,.26); }
+    #cams button.on { color: #0f1116; background: #e8a33d; border-color: #e8a33d; }
+
+    #hud {
+      position: absolute; right: 10px; top: 10px; text-align: right;
+      font-size: 10.5px; line-height: 1.5; color: #7e8695; pointer-events: none;
+    }
+    #hover {
+      position: absolute; pointer-events: none; display: none;
+      font-size: 11px; color: #e7eaf0; background: rgba(16, 18, 24, .92);
+      border: 1px solid rgba(255,255,255,.14); border-radius: 4px;
+      padding: 4px 8px; transform: translate(10px, 10px); white-space: nowrap;
+    }
+    #empty {
+      position: absolute; inset: 0; display: flex; align-items: center;
+      justify-content: center; color: #6f7784; font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="labels"></div>
+    <div id="cams"></div>
+    <div id="hud"></div>
+    <div id="hover"></div>
+    <div id="empty">waiting for scene data…</div>
+  </div>
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/streamlit-bridge.js"></script>
+  <script src="scene.js"></script>
+</body>
+</html>

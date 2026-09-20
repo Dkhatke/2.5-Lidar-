@@ -258,11 +258,17 @@ adaptive_lidar/
     inspector.py           the eight-section cell and object inspectors
     playback_controller.py the transport; no Streamlit in the state machine
     ui_layout.py           header, status badges, CSS, metrics strip
+    session.py             the state the two visualisation tabs share
+    profile.py             FOVEA_PROFILE=1 diagnostic trace
     live_demo.py           the Live demo tab (one st.fragment)
+    scene_data.py          pipeline data -> scene geometry (the adapter)
+    scene_component.py     the three.js component, declared from files
+    scene_frontend/        index.html, scene.js, vendored three.js
+    scene_demo.py          the Scene demo tab
     drive_tab.py           scene presets + the diagnostics panel
   scripts/                 profiling, training, the five verifications,
                            baselines, report generation
-  tests/                   167 tests, including the gt-isolation guard
+  tests/                   213 tests, including the gt-isolation guard
 ```
 
 ---
@@ -291,6 +297,34 @@ The replay rate on screen is a replay rate. It is bounded by drawing and
 shipping the canvas (~95 ms of server time per displayed frame, ~460 ms end
 to end), and it says nothing about pipeline latency, which is reported
 separately and stratified by range.
+
+---
+
+## The scene view
+
+The Scene demo draws the same run as the physical environment the map is a
+map of. It runs no perception of its own: `scene_data.build_scene_data`
+turns one cached frame into geometry — cells become boxes at their real
+footprint from `ground_z` to `z_max`, tracked instances become primitives,
+the stored pose becomes the vehicle — and three.js puts it on screen.
+
+**No pipeline logic lives in JavaScript.** Positions, sizes, colours and
+traversability verdicts are all decided in Python, from the same tables the
+2D renderer uses. The browser reports a click back as a world point and an
+optional track id; resolving that to a cell is still `selection.py`'s job
+against the cached frame, so the two views cannot disagree about what is
+under a place.
+
+Where drawn geometry is not measured geometry, it says so. A tracked
+object's box is the bounding box of the returns, and a LiDAR sees one side
+of a car, so a box smaller than its class floor is enlarged to be visible —
+drawn fainter, flagged `padded`, and the inspector prints both the measured
+and the drawn extent.
+
+Frame, playback and selection are shared with the Live demo through
+`session.py`. The displayed frame is derived from the clock rather than
+incremented per redraw, which is what lets two tabs render the same run at
+their own rates without playing it twice as fast.
 
 ---
 

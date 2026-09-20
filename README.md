@@ -85,7 +85,7 @@ python scripts/test_allocation.py          # retention vs budget
 python scripts/test_temporal.py            # the MOS gate
 python scripts/eval_semantic.py            # M1/M6: per-class IoU by range
 python scripts/test_interaction.py         # click -> cell, on a real run
-python -m pytest tests/ -q                 # 167 tests
+python -m pytest tests/ -q                 # 213 tests
 ```
 
 Selected measured outcomes:
@@ -133,6 +133,19 @@ inspector on the right.
   while it runs, and advancing a frame never re-enters the pipeline. The
   rate on screen is labelled a replay rate — it is bounded by drawing the
   canvas, not by perception.
+**Scene demo** draws the same run as the physical environment the map is a
+map of: cells become surfaces at their real footprint, from `ground_z` to
+`z_max`; tracked instances become boxes, poles and figures; the stored pose
+becomes the vehicle. Orbit, top, chase and sensor cameras; click a surface
+and the *same* inspector opens on the *same* cell. It is a three.js
+component built from four static files vendored in the repository — no
+build step, no CDN, nothing fetched at run time.
+
+Nothing there is a second perception run, and where drawn geometry is not
+measured geometry it says so: a LiDAR sees one side of a car, so a box
+enlarged to be visible is shaded fainter and the inspector prints both the
+measured and the drawn extent.
+
 * Two more tabs hold the engineering work: **Research & evaluation** (the
   equal-memory comparison, range-stratified accuracy, per-stage latency) and
   **Debug & cell inspector** (query the live map by coordinate).
@@ -181,7 +194,7 @@ adaptive_lidar/
   data/       raycast sensor model, loader, label maps
   utils/      grouping, spatial index, range image, voxel hash
   scripts/    profiling, training, verification, baselines, report
-  tests/      167 tests
+  tests/      213 tests
   models/     the trained weights
   docs/       RESULTS.md, ARCHITECTURE.md, figures, CSVs
 PROGRESS.md   the working log, with pasted verification output

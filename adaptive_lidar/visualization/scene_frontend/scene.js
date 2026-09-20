@@ -1,0 +1,714 @@
+/*
+ * FOVEA scene renderer.
+ *
+ * This file draws what Python decided. It contains no perception, no
+ * mapping and no classification: every position, size, colour and verdict
+ * arrives in the render payload from `scene_data.build_scene_data`, and the
+ * only thing computed here is what a camera and a mouse are for.
+ *
+ * AXES
+ *   The project's world is x east, y north, z up. three.js is y up, so the
+ *   mapping is (x, y, z) -> (x, z, -y). It is applied in exactly one place,
+ *   `w2t`, and nothing else in this file touches the convention.
+ *
+ * CELLS
+ *   One InstancedMesh for the whole grid. Tens of thousands of separate
+ *   meshes would be tens of thousands of draw calls; one instanced box is
+ *   one. Each instance is scaled to the cell's REAL footprint and to its
+ *   real base-to-top extent, times the height scale Python chose.
+ *
+ * THE GRID GAP
+ *   With "show adaptive grid" on, each cell is drawn at 88% of its true
+ *   footprint, so the dark seam between neighbours reads as a boundary and
+ *   the size difference between a 5 cm and an 80 cm cell is obvious. It is
+ *   a drawing device; the footprint the inspector reports is the true one.
+ *
+ * SELECTION
+ *   A click raycasts objects first and cells second, the same priority the
+ *   Python hit test uses. What goes back to Streamlit is a world point and
+ *   an optional track id — never a cell index — so the authoritative lookup
+ *   still happens in `selection.py` against the real cached frame.
+ */
+/* global THREE, Streamlit */
+"use strict";
+
+// ─────────────────────────────────────────────────────────────
+// state that must survive a re-render
+// ─────────────────────────────────────────────────────────────
+var S = {
+  renderer: null, scene: null, camera: null,
+  cellMesh: null, cellXY: null, cellZ: null, cellSize: null,
+  objectGroup: null, egoGroup: null, ringGroup: null, pointCloud: null,
+  markerGroup: null,
+  objects: [], labels: [], ringLabels: [],
+  camMode: "orbit",
+  // Orbit state, in world units. Kept here so a frame advance does not
+  // move the camera: the payload changes every displayed frame and the
+  // view must not jump with it.
+  orbit: { yaw: -2.35, pitch: 0.62, dist: 68, target: [0, 0, 0] },
+  drag: null, moved: 0, lastArgs: null, width: 0, height: 520,
+  needsRender: true, hoverName: null,
+};
+
+var HOST = document.getElementById("wrap");
+var LABELS = document.getElementById("labels");
+var CAMS = document.getElementById("cams");
+var HUD = document.getElementById("hud");
+var HOVER = document.getElementById("hover");
+var EMPTY = document.getElementById("empty");
+
+var CAM_MODES = [
+  ["orbit", "Orbit"], ["top", "Top"], ["chase", "Chase"],
+  ["sensor", "Sensor"], ["reset", "Reset"],
+];
+
+var STATE_RGB = [0x5b6470, 0xd9483f, 0xc98a1e];   // STATIC, MOVING, MOVABLE
+var SELECT_RGB = 0xffd60a;
+
+// ─────────────────────────────────────────────────────────────
+// helpers
+// ─────────────────────────────────────────────────────────────
+function b64(s, Type) {
+  var bin = atob(s), n = bin.length, buf = new Uint8Array(n);
+  for (var i = 0; i < n; i++) buf[i] = bin.charCodeAt(i);
+  return new Type(buf.buffer);
+}
+
+/** world (x east, y north, z up) -> three (y up). The only place. */
+function w2t(x, y, z) { return new THREE.Vector3(x, z, -y); }
+
+function col(rgb01) {
+  return new THREE.Color(rgb01[0], rgb01[1], rgb01[2]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// one-time setup
+// ─────────────────────────────────────────────────────────────
+function init(width, height) {
+  S.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  S.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  S.renderer.setSize(width, height);
+  S.renderer.setClearColor(0x0f1116, 1);
+  HOST.appendChild(S.renderer.domElement);
+
+  S.scene = new THREE.Scene();
+  S.scene.fog = new THREE.Fog(0x0f1116, 90, 190);
+
+  S.camera = new THREE.PerspectiveCamera(48, width / height, 0.3, 900);
+
+  // Flat, even lighting. Shadows and speculars would imply a surface
+  // finish the data says nothing about.
+  S.scene.add(new THREE.HemisphereLight(0xcfd8e6, 0x1a1d24, 1.05));
+  var key = new THREE.DirectionalLight(0xffffff, 0.34);
+  key.position.set(0.4, 1, 0.25);
+  S.scene.add(key);
+
+  S.objectGroup = new THREE.Group();
+  S.egoGroup = new THREE.Group();
+  S.ringGroup = new THREE.Group();
+  S.markerGroup = new THREE.Group();
+  S.scene.add(S.objectGroup, S.egoGroup, S.ringGroup, S.markerGroup);
+
+  buildCamButtons();
+  bindPointer();
+  observeResize();
+  animate();
+}
+
+/** Follow the column width.
+ *
+ * The render payload only arrives when Streamlit reruns, so without this
+ * the canvas keeps whatever size it had when the page last rendered: widen
+ * or narrow the browser and the scene sits stretched in a corner of a
+ * stale viewport.
+ */
+function observeResize() {
+  var apply = function () {
+    var w = HOST.clientWidth || S.width;
+    var h = S.height;
+    if (!w || (w === S.width)) return;
+    S.width = w;
+    S.renderer.setSize(w, h);
+    S.camera.aspect = w / h;
+    S.camera.updateProjectionMatrix();
+    S.needsRender = true;
+  };
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(apply).observe(HOST);
+  }
+  window.addEventListener("resize", apply);
+}
+
+function buildCamButtons() {
+  CAM_MODES.forEach(function (m) {
+    var b = document.createElement("button");
+    b.textContent = m[1];
+    b.dataset.mode = m[0];
+    b.onclick = function () {
+      if (m[0] === "reset") {
+        S.orbit.yaw = -2.35; S.orbit.pitch = 0.62; S.orbit.dist = 68;
+        S.camMode = "orbit";
+      } else {
+        S.camMode = m[0];
+      }
+      syncCamButtons();
+      S.needsRender = true;
+    };
+    CAMS.appendChild(b);
+  });
+  syncCamButtons();
+}
+
+function syncCamButtons() {
+  Array.prototype.forEach.call(CAMS.children, function (b) {
+    b.className = b.dataset.mode === S.camMode ? "on" : "";
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// camera
+// ─────────────────────────────────────────────────────────────
+function placeCamera(args) {
+  var ego = args.ego, ex = ego.xy[0], ey = ego.xy[1], h = ego.heading;
+  var t = S.orbit.target;
+
+  if (S.camMode === "top") {
+    // Straight down, world-north up. Not a true orthographic projection —
+    // a long lens from high up, which reads the same at this scale.
+    S.camera.position.set(t[0], S.orbit.dist * 1.25, -t[1] + 0.01);
+    S.camera.up.set(0, 0, -1);
+    S.camera.lookAt(w2t(t[0], t[1], 0));
+    return;
+  }
+  S.camera.up.set(0, 1, 0);
+
+  if (S.camMode === "chase") {
+    var back = 16, up = 8;
+    S.camera.position.copy(
+      w2t(ex - back * Math.cos(h), ey - back * Math.sin(h), up));
+    S.camera.lookAt(w2t(ex + 14 * Math.cos(h), ey + 14 * Math.sin(h), 0.6));
+    return;
+  }
+  if (S.camMode === "sensor") {
+    S.camera.position.copy(w2t(ex, ey, ego.sensorZ));
+    S.camera.lookAt(
+      w2t(ex + 30 * Math.cos(h), ey + 30 * Math.sin(h), ego.sensorZ - 1.2));
+    return;
+  }
+  // orbit
+  var o = S.orbit, cp = Math.cos(o.pitch);
+  S.camera.position.set(
+    t[0] + o.dist * cp * Math.cos(o.yaw),
+    o.dist * Math.sin(o.pitch),
+    -t[1] + o.dist * cp * Math.sin(o.yaw));
+  S.camera.lookAt(w2t(t[0], t[1], 0));
+}
+
+// ─────────────────────────────────────────────────────────────
+// pointer: orbit / pan / zoom / select
+// ─────────────────────────────────────────────────────────────
+function bindPointer() {
+  var el = S.renderer.domElement;
+  el.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+
+  el.addEventListener("pointerdown", function (e) {
+    el.setPointerCapture(e.pointerId);
+    S.drag = { x: e.clientX, y: e.clientY,
+               pan: e.button === 1 || e.button === 2 || e.shiftKey };
+    S.moved = 0;
+  });
+
+  el.addEventListener("pointermove", function (e) {
+    if (!S.drag) { hoverTest(e); return; }
+    var dx = e.clientX - S.drag.x, dy = e.clientY - S.drag.y;
+    S.drag.x = e.clientX; S.drag.y = e.clientY;
+    S.moved += Math.abs(dx) + Math.abs(dy);
+    if (S.camMode !== "orbit" && S.camMode !== "top") {
+      // Chase and sensor are anchored to the vehicle; dragging them would
+      // mean two different ideas of where the camera is.
+      return;
+    }
+    if (S.drag.pan) {
+      // Pan in the ground plane, scaled so the grab point tracks the cursor.
+      var k = S.orbit.dist * 0.0016;
+      var yaw = S.camMode === "top" ? -Math.PI / 2 : S.orbit.yaw;
+      S.orbit.target[0] -= (dx * Math.sin(yaw) + dy * Math.cos(yaw)) * k;
+      S.orbit.target[1] -= (dx * -Math.cos(yaw) + dy * Math.sin(yaw)) * k;
+    } else if (S.camMode === "orbit") {
+      S.orbit.yaw -= dx * 0.006;
+      S.orbit.pitch = Math.max(0.06, Math.min(1.45,
+        S.orbit.pitch + dy * 0.005));
+    }
+    S.needsRender = true;
+  });
+
+  el.addEventListener("pointerup", function (e) {
+    var wasDrag = S.moved > 5;
+    S.drag = null;
+    if (!wasDrag && e.button === 0) select(e);
+  });
+
+  el.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    S.orbit.dist = Math.max(6, Math.min(320,
+      S.orbit.dist * (1 + Math.sign(e.deltaY) * 0.11)));
+    S.needsRender = true;
+  }, { passive: false });
+}
+
+function ndc(e) {
+  var r = S.renderer.domElement.getBoundingClientRect();
+  return new THREE.Vector2(
+    ((e.clientX - r.left) / r.width) * 2 - 1,
+    -((e.clientY - r.top) / r.height) * 2 + 1);
+}
+
+function pick(e) {
+  var ray = new THREE.Raycaster();
+  ray.setFromCamera(ndc(e), S.camera);
+  // Objects first, then cells — the same priority the Python hit test uses.
+  var hitObj = ray.intersectObjects(S.objectGroup.children, true)[0];
+  if (hitObj) {
+    var o = hitObj.object;
+    while (o && o.userData.objectId === undefined) o = o.parent;
+    if (o) return { kind: "object", id: o.userData.objectId,
+                    name: o.userData.label };
+  }
+  if (S.cellMesh) {
+    var hitCell = ray.intersectObject(S.cellMesh, false)[0];
+    if (hitCell && hitCell.instanceId !== undefined) {
+      var i = hitCell.instanceId;
+      return { kind: "cell", x: S.cellXY[2 * i], y: S.cellXY[2 * i + 1] };
+    }
+  }
+  return { kind: "empty" };
+}
+
+function select(e) {
+  var p = pick(e);
+  p.t = Date.now();
+  if (p.kind === "empty") {
+    // Still send it: "I clicked nothing" is a real answer, and the panel
+    // says so rather than leaving the previous selection looking current.
+    var g = groundPoint(e);
+    if (g) { p.x = g[0]; p.y = g[1]; }
+  }
+  Streamlit.setComponentValue(p);
+}
+
+/** Where the cursor ray meets z = 0, for a click that hit no geometry. */
+function groundPoint(e) {
+  var ray = new THREE.Raycaster();
+  ray.setFromCamera(ndc(e), S.camera);
+  var hit = new THREE.Vector3();
+  var plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  if (!ray.ray.intersectPlane(plane, hit)) return null;
+  return [hit.x, -hit.z];
+}
+
+function hoverTest(e) {
+  var p = pick(e);
+  var text = null;
+  if (p.kind === "object") text = p.name;
+  else if (p.kind === "cell") text = p.x.toFixed(2) + ", " + p.y.toFixed(2) + " m";
+  if (text) {
+    HOVER.style.display = "block";
+    HOVER.textContent = text;
+    var r = S.renderer.domElement.getBoundingClientRect();
+    HOVER.style.left = (e.clientX - r.left) + "px";
+    HOVER.style.top = (e.clientY - r.top) + "px";
+  } else {
+    HOVER.style.display = "none";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// cells
+// ─────────────────────────────────────────────────────────────
+function buildCells(args) {
+  if (S.cellMesh) {
+    S.scene.remove(S.cellMesh);
+    S.cellMesh.geometry.dispose();
+    S.cellMesh.material.dispose();
+    S.cellMesh = null;
+  }
+  var c = args.cells;
+  if (!c || !c.n) { S.cellXY = null; return; }
+
+  var n = c.n;
+  var xy = b64(c.xy, Float32Array);
+  var zcm = b64(c.zcm, Int16Array);
+  var lvl = b64(c.level, Uint8Array);
+  var cls = b64(c.cls, Uint8Array);
+  var trav = b64(c.trav, Uint8Array);
+  var ret = b64(c.returns, Uint8Array);
+  S.cellXY = xy;
+
+  var pal = args.palettes;
+  var mode = args.colourBy;
+  var hs = args.heightScale;
+  var gap = args.showGrid ? 0.88 : 1.0;
+  var zlo = c.zRange[0], zhi = Math.max(c.zRange[1], zlo + 0.001);
+
+  var geo = new THREE.BoxBufferGeometry(1, 1, 1);
+  var mat = new THREE.MeshLambertMaterial({ vertexColors: false });
+  var mesh = new THREE.InstancedMesh(geo, mat, n);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+  var m = new THREE.Matrix4(), q = new THREE.Quaternion();
+  var pos = new THREE.Vector3(), scl = new THREE.Vector3();
+  var colour = new THREE.Color(), tmp = new THREE.Color();
+
+  for (var i = 0; i < n; i++) {
+    var size = c.sizes[lvl[i]];
+    var base = zcm[2 * i] / 100, top = zcm[2 * i + 1] / 100;
+    // A flat cell is still drawn with a sliver of thickness so it catches
+    // the light and reads as a surface rather than as a z-fighting plane.
+    var h = Math.max((top - base) * hs, 0.02);
+    scl.set(size * gap, h, size * gap);
+    pos.copy(w2t(xy[2 * i], xy[2 * i + 1], base + h / 2));
+    m.compose(pos, q, scl);
+    mesh.setMatrixAt(i, m);
+
+    if (mode === "traversability") {
+      colour.setRGB.apply(colour, pal.traversability[trav[i]]);
+    } else if (mode === "resolution level") {
+      colour.setRGB.apply(colour, pal.level[lvl[i]]);
+    } else if (mode === "height") {
+      var t = Math.min(1, Math.max(0, (top - zlo) / (zhi - zlo)));
+      colour.setHSL(0.62 - 0.62 * t, 0.62, 0.30 + 0.28 * t);
+    } else {
+      colour.setRGB.apply(colour, pal.semantic[cls[i]]);
+    }
+    // A cell backed by one return is dimmer than one backed by forty. It
+    // is the same "observed vs barely observed" distinction the inspector
+    // spells out, made visible without a separate layer.
+    var conf = 0.62 + 0.38 * Math.min(1, ret[i] / 12);
+    tmp.copy(colour).multiplyScalar(conf);
+    mesh.setColorAt(i, tmp);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.frustumCulled = false;
+  S.cellMesh = mesh;
+  S.scene.add(mesh);
+}
+
+// ─────────────────────────────────────────────────────────────
+// objects
+// ─────────────────────────────────────────────────────────────
+function primitiveGeometry(o) {
+  var s = o.size;
+  if (o.primitive === "pole") {
+    return new THREE.CylinderBufferGeometry(
+      Math.max(s[0], s[1]) / 2, Math.max(s[0], s[1]) / 2, s[2], 10);
+  }
+  if (o.primitive === "person") {
+    // A narrow capsule-ish column. r128 has no CapsuleGeometry, and a
+    // cylinder with a domed top reads as a person at this scale.
+    return new THREE.CylinderBufferGeometry(
+      Math.max(s[0], s[1]) / 2, Math.max(s[0], s[1]) / 2.4, s[2], 8);
+  }
+  return new THREE.BoxBufferGeometry(s[0], s[1], s[2]);
+}
+
+function buildObjects(args) {
+  while (S.objectGroup.children.length) {
+    var c = S.objectGroup.children.pop();
+    S.objectGroup.remove(c);
+  }
+  S.objects = args.objects || [];
+  if (!args.showObjects) return;
+
+  S.objects.forEach(function (o) {
+    var g = new THREE.Group();
+    g.userData.objectId = o.id;
+    g.userData.label = o.label + "  ·  " + o.stateName;
+
+    var geo = primitiveGeometry(o);
+    var rgb = STATE_RGB[o.state];
+    var solid = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      color: rgb, transparent: true,
+      // A padded box is drawn fainter than a measured one, so a viewer can
+      // see at a glance which outlines the sensor actually established.
+      opacity: o.geomSource === "padded" ? 0.20 : 0.34,
+      depthWrite: false,
+    }));
+    var wire = new THREE.LineSegments(
+      new THREE.EdgesGeometry(geo),
+      new THREE.LineBasicMaterial({ color: rgb }));
+    g.add(solid, wire);
+
+    g.position.copy(w2t(o.centre[0], o.centre[1], o.centre[2]));
+    if (o.primitive === "box" || o.primitive === "vehicle") {
+      g.rotation.y = -o.yaw;
+    }
+    S.objectGroup.add(g);
+
+    if (args.showVelocity && o.stateName === "MOVING" && o.speed > 0.4) {
+      S.objectGroup.add(arrow(o));
+    }
+  });
+}
+
+/** Velocity as an arrow, 1 m per m/s — the 2D overlay's own convention. */
+function arrow(o) {
+  var from = w2t(o.centre[0], o.centre[1], o.centre[2]);
+  var dir = w2t(o.vel[0], o.vel[1], 0).normalize();
+  var len = Math.min(Math.max(o.speed, 1.0), 14);
+  var a = new THREE.ArrowHelper(dir, from, len, STATE_RGB[1], 1.1, 0.6);
+  a.userData.objectId = o.id;
+  a.userData.label = o.label + "  ·  " + o.speed.toFixed(1) + " m/s";
+  return a;
+}
+
+// ─────────────────────────────────────────────────────────────
+// ego, rings, points, selection marker
+// ─────────────────────────────────────────────────────────────
+function buildEgo(args) {
+  while (S.egoGroup.children.length) S.egoGroup.remove(S.egoGroup.children[0]);
+  var e = args.ego, s = e.size;
+
+  var body = new THREE.Mesh(
+    new THREE.BoxBufferGeometry(s[0], s[1], s[2]),
+    new THREE.MeshLambertMaterial({ color: 0x2f7fd1, transparent: true,
+                                    opacity: 0.42, depthWrite: false }));
+  var wire = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxBufferGeometry(s[0], s[1], s[2])),
+    new THREE.LineBasicMaterial({ color: 0x8fc7ff }));
+  var g = new THREE.Group();
+  g.add(body, wire);
+
+  // Forward indicator, so "which way is the vehicle pointing" never has to
+  // be inferred from the box.
+  var nose = new THREE.Mesh(
+    new THREE.ConeBufferGeometry(0.45, 1.4, 12),
+    new THREE.MeshLambertMaterial({ color: 0xffd60a }));
+  nose.rotation.z = -Math.PI / 2;
+  nose.position.set(s[0] / 2 + 0.7, 0, 0);
+  g.add(nose);
+
+  // The sensor, at its configured mount height.
+  var sensor = new THREE.Mesh(
+    new THREE.SphereBufferGeometry(0.22, 12, 10),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  sensor.position.set(0, 0, e.sensorZ - s[2] / 2);
+  g.add(sensor);
+  var mast = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(0, 0, e.sensorZ - s[2] / 2)]),
+    new THREE.LineBasicMaterial({ color: 0x6f7784 }));
+  g.add(mast);
+
+  // Build in world axes, then rotate the whole rig into three's frame.
+  g.rotation.x = -Math.PI / 2;
+  var outer = new THREE.Group();
+  outer.add(g);
+  outer.rotation.y = -e.heading;
+  outer.position.copy(w2t(e.xy[0], e.xy[1], s[2] / 2));
+  S.egoGroup.add(outer);
+}
+
+function buildRings(args) {
+  while (S.ringGroup.children.length) {
+    S.ringGroup.remove(S.ringGroup.children[0]);
+  }
+  S.ringLabels = [];
+  if (!args.showRings) return;
+  var e = args.ego;
+  args.rings.forEach(function (r) {
+    var pts = [];
+    for (var a = 0; a <= 96; a++) {
+      var th = (a / 96) * Math.PI * 2;
+      pts.push(w2t(e.xy[0] + r * Math.cos(th), e.xy[1] + r * Math.sin(th),
+                   0.02));
+    }
+    var line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: 0x39404d }));
+    S.ringGroup.add(line);
+    S.ringLabels.push({
+      r: r, text: r + " m",
+      // Labelled ahead of the vehicle, where the scene is.
+      p: w2t(e.xy[0] + r * Math.cos(e.heading),
+             e.xy[1] + r * Math.sin(e.heading), 0.05),
+    });
+  });
+}
+
+function buildPoints(args) {
+  if (S.pointCloud) {
+    S.scene.remove(S.pointCloud);
+    S.pointCloud.geometry.dispose();
+    S.pointCloud.material.dispose();
+    S.pointCloud = null;
+  }
+  var p = args.points;
+  if (!p || !p.n) return;
+  var xyz = b64(p.xyz, Float32Array);
+  var arr = new Float32Array(p.n * 3);
+  for (var i = 0; i < p.n; i++) {
+    arr[3 * i] = xyz[3 * i];
+    arr[3 * i + 1] = xyz[3 * i + 2];
+    arr[3 * i + 2] = -xyz[3 * i + 1];
+  }
+  var geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(arr, 3));
+  S.pointCloud = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xeb2b46, size: 0.16, sizeAttenuation: true }));
+  S.scene.add(S.pointCloud);
+}
+
+function buildMarker(args) {
+  while (S.markerGroup.children.length) {
+    S.markerGroup.remove(S.markerGroup.children[0]);
+  }
+  var sel = args.selected;
+  if (!sel || !sel.kind) return;
+
+  if (sel.kind === "cell") {
+    var size = Math.max(sel.size, 0.35);   // findable even at 5 cm
+    var h = Math.max((sel.z[1] - sel.z[0]) * args.heightScale, 0.05) + 0.3;
+    var box = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxBufferGeometry(size, h, size)),
+      new THREE.LineBasicMaterial({ color: SELECT_RGB }));
+    box.position.copy(w2t(sel.xy[0], sel.xy[1], sel.z[0] + h / 2));
+    S.markerGroup.add(box);
+    S.markerGroup.add(beacon(sel.xy[0], sel.xy[1], sel.z[1] + 0.4));
+  } else if (sel.kind === "object") {
+    var o = null;
+    S.objects.forEach(function (x) { if (x.id === sel.id) o = x; });
+    if (!o) return;
+    var halo = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxBufferGeometry(
+        o.size[0] + 0.7, o.size[2] + 0.7, o.size[1] + 0.7)),
+      new THREE.LineBasicMaterial({ color: SELECT_RGB }));
+    halo.position.copy(w2t(o.centre[0], o.centre[1], o.centre[2]));
+    S.markerGroup.add(halo);
+    S.markerGroup.add(beacon(o.centre[0], o.centre[1],
+                             o.centre[2] + o.size[2] / 2 + 0.5));
+  }
+}
+
+/** A short vertical stalk, so a selected 5 cm cell is findable at 50 m. */
+function beacon(x, y, z) {
+  return new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([
+      w2t(x, y, z), w2t(x, y, z + 2.2)]),
+    new THREE.LineBasicMaterial({ color: SELECT_RGB }));
+}
+
+// ─────────────────────────────────────────────────────────────
+// HTML labels, projected each frame
+// ─────────────────────────────────────────────────────────────
+function refreshLabels(args) {
+  LABELS.innerHTML = "";
+  var w = S.width, h = S.height;
+
+  var placed = [];
+  function place(text, v3, cls, spaced) {
+    var p = v3.clone().project(S.camera);
+    if (p.z > 1 || p.x < -1.05 || p.x > 1.05 || p.y < -1.05 || p.y > 1.05) {
+      return;
+    }
+    var sx = (p.x + 1) / 2 * w, sy = (1 - p.y) / 2 * h;
+    if (spaced) {
+      // Overlapping labels are worse than missing ones: two stacked boxes
+      // are unreadable, one is not.
+      for (var i = 0; i < placed.length; i++) {
+        if (Math.abs(placed[i][0] - sx) < 96 &&
+            Math.abs(placed[i][1] - sy) < 15) return;
+      }
+      placed.push([sx, sy]);
+    }
+    var d = document.createElement("div");
+    d.className = cls;
+    d.textContent = text;
+    d.style.left = sx + "px";
+    d.style.top = sy + "px";
+    LABELS.appendChild(d);
+  }
+
+  if (args.showLabels) {
+    // Nearest first, capped: a label on every one of forty tracks is a
+    // wall of text, not information.
+    var sorted = S.objects.slice().sort(function (a, b) {
+      // Movers first, then the non-ground classes, then nearest. A label
+      // on a cluster the classifier called road is real output but it is
+      // not what anyone is reading the scene for.
+      var ka = (a.stateName === "MOVING" ? 0 : 1) * 10 + (a.cls < 2 ? 5 : 0);
+      var kb = (b.stateName === "MOVING" ? 0 : 1) * 10 + (b.cls < 2 ? 5 : 0);
+      return ka !== kb ? ka - kb : a.range - b.range;
+    }).slice(0, 12);
+    sorted.forEach(function (o) {
+      place(o.label,
+            w2t(o.centre[0], o.centre[1], o.centre[2] + o.size[2] / 2 + 0.35),
+            "lbl" + (o.stateName === "MOVING" ? " moving" : ""), true);
+    });
+  }
+  S.ringLabels.forEach(function (r) { place(r.text, r.p, "ring-lbl"); });
+}
+
+// ─────────────────────────────────────────────────────────────
+// render loop
+// ─────────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  if (!S.needsRender || !S.lastArgs) return;
+  S.needsRender = false;
+  placeCamera(S.lastArgs);
+  S.renderer.render(S.scene, S.camera);
+  refreshLabels(S.lastArgs);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Streamlit
+// ─────────────────────────────────────────────────────────────
+function onRender(event) {
+  var args = event.detail.args;
+  var data = args.data;
+  if (!data) return;
+  Object.keys(args).forEach(function (k) {
+    if (k !== "data") data[k] = args[k];
+  });
+
+  var width = HOST.clientWidth || args.width || 900;
+  var height = args.height || 520;
+
+  if (!S.renderer) { S.width = width; S.height = height; init(width, height); }
+  if (width !== S.width || height !== S.height) {
+    S.width = width; S.height = height;
+    S.renderer.setSize(width, height);
+    S.camera.aspect = width / height;
+    S.camera.updateProjectionMatrix();
+  }
+
+  // The orbit target follows the vehicle so the camera stays useful as the
+  // run plays, but the world itself is never transformed: every position in
+  // the payload is world-anchored and is drawn exactly where Python put it.
+  S.orbit.target = [args.data.ego.xy[0], args.data.ego.xy[1], 0];
+
+  EMPTY.style.display = data.cells && data.cells.n ? "none" : "flex";
+
+  buildCells(data);
+  buildObjects(data);
+  buildEgo(data);
+  buildRings(data);
+  buildPoints(data);
+  buildMarker(data);
+
+  HUD.innerHTML =
+    "frame " + (data.frame.index + 1) + " / " + data.frame.count +
+    "<br>" + data.cells.n.toLocaleString() + " cells · " +
+    data.objects.length + " objects" +
+    "<br>drag orbit · shift-drag pan · wheel zoom · click to inspect";
+
+  S.lastArgs = data;
+  S.needsRender = true;
+  Streamlit.setFrameHeight(height);
+}
+
+Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+Streamlit.setComponentReady();
+Streamlit.setFrameHeight(520);

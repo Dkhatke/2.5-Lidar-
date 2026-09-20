@@ -33,12 +33,17 @@ torch>=2.0                # PointFeatureNet: 11,406 parameters, CPU inference
 # stepping below that rather than failing, but nothing else is affected.
 streamlit>=1.33           # the dashboard
 streamlit-image-coordinates>=0.1.9   # click-to-select on the map canvas
+#
+# The Scene demo's 3D renderer adds NO Python dependency: three.js r128
+# (MIT) is vendored at visualization/scene_frontend/vendor/three.min.js and
+# served as a static Streamlit component. No node, no build step, and
+# nothing fetched at run time — a fresh clone renders it offline.
 matplotlib>=3.7           # docs/*.png
 pillow>=10.0              # image I/O for the rendered map
 
 # ── Config and testing ─────────────────────────────────────
 pyyaml>=6.0               # config.yaml
-pytest>=7.0               # 163 tests
+pytest>=7.0               # 213 tests
 
 # ── Optional, tried at import and never required ───────────
 # pypatchworkpp           # ground segmentation; ring-geometry is the fallback

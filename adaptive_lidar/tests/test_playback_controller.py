@@ -159,17 +159,54 @@ def test_run_every_is_none_for_a_single_frame():
     assert c.run_every() is None
 
 
-def test_the_tick_gate_ignores_reruns_that_are_not_the_timer():
-    """A fragment reruns for two reasons; only the timer may advance.
+def test_the_frame_follows_the_clock_not_the_redraw_count():
+    """A redraw is not a frame.
 
-    Without the wall-clock gate, dragging the timeline during playback would
-    also steal a frame, because a widget change reruns the same fragment.
+    A fragment reruns both on its timer and on any widget inside it, and
+    two tabs each hold a transport bound to this one state. If every
+    redraw incremented the index, the run would play at the sum of their
+    render rates. It is a function of elapsed time instead.
     """
-    c = PlaybackController(state=PlaybackState(10, playing=True, speed="1x"))
-    assert c.tick_if_playing(now=100.0) is True        # first tick arms it
-    assert c.tick_if_playing(now=100.01) is False      # widget-driven rerun
-    assert c.tick_if_playing(now=100.30) is True       # the timer again
-    assert c.state.frame_idx == 2
+    c = PlaybackController(state=PlaybackState(100, playing=True,
+                                               speed="1x"))
+    assert c.tick_if_playing(now=100.0) is False       # starts the clock
+    assert c.state.frame_idx == 0
+    c.tick_if_playing(now=100.35)
+    assert c.state.frame_idx == 3                      # 350 ms at 100 ms
+    # Ten extra redraws in the same instant change nothing.
+    for _ in range(10):
+        c.tick_if_playing(now=100.35)
+    assert c.state.frame_idx == 3
+
+
+def test_two_renderers_do_not_double_the_playback_rate():
+    """The property the whole clock-driven design exists for.
+
+    Live demo and Scene demo both bind to one PlaybackState and both
+    re-render on their own timers. Playing must look the same as it would
+    with one of them.
+    """
+    state = PlaybackState(100, playing=True, speed="1x")
+    a = PlaybackController(key="live", state=state)
+    b = PlaybackController(key="scene", state=state)
+    a.tick_if_playing(now=50.0)
+    for k in range(1, 21):
+        t = 50.0 + k * 0.05
+        a.tick_if_playing(now=t)       # the fast tab
+        b.tick_if_playing(now=t)       # the slow one, same instant
+    # One second of wall clock at 1x is ten frames, whoever drew it.
+    assert state.frame_idx == 10
+
+
+def test_scrubbing_restarts_the_clock_from_where_it_was_dropped():
+    c = PlaybackController(state=PlaybackState(100, playing=True))
+    c.tick_if_playing(now=10.0)
+    c.tick_if_playing(now=10.5)
+    assert c.state.frame_idx == 5
+    c.state.seek(60)
+    c.tick_if_playing(now=10.6)        # re-arms
+    c.tick_if_playing(now=10.9)
+    assert c.state.frame_idx == 63
 
 
 # ════════════════════════════════════════════════════════════

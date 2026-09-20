@@ -39,33 +39,37 @@ from adaptive_lidar.visualization import interactive_map as IM
 from adaptive_lidar.visualization import overlays as OV
 from adaptive_lidar.visualization import render as R
 from adaptive_lidar.visualization import selection as SEL
+from adaptive_lidar.visualization import session as SESSION
 from adaptive_lidar.visualization import ui_layout as UI
 from adaptive_lidar.visualization.drive_tab import PRESETS, scene_diagnostics
+from adaptive_lidar.visualization import profile as PROFILE
 from adaptive_lidar.visualization.playback_controller import PlaybackController
 
 #: Fixed height for the two side rails, in pixels. Chosen to match the
 #: canvas so the workspace fits one screen and the transport stays visible.
 RAIL_H = 640
 
-#: Set FOVEA_PROFILE=1 to print per-redraw timing to the server console.
-_PROFILE = bool(__import__("os").environ.get("FOVEA_PROFILE"))
+#: Measured floor on this tab's redraw: ~95 ms of server time for the
+#: canvas plus the PNG encode, so scheduling below this only builds a
+#: backlog. Set FOVEA_PROFILE=1 to see the real numbers.
+MIN_REDRAW_S = 0.15
 
-_SEL_KEY = "live_selection"
+
+
+#: Selection and playback are SHARED with the Scene demo tab, so that
+#: switching tabs keeps the same frame and the same selected cell. Only the
+#: widget keys stay per-tab.
+_SEL_KEY = SESSION.SELECTION_KEY
 _CANVAS_KEY = "live_canvas"
 
 
 def _refresh() -> None:
-    """Redraw. Fragment-scoped where the installed Streamlit supports it.
+    """Redraw. See :func:`session.refresh` for why this is app-scoped.
 
-    Scoping matters: a whole-app rerun here would re-enter every other tab,
-    and on a cold cache that means re-running the pipeline to service a
-    click.
+    In short: the selection is shared with the Scene demo tab, and a
+    fragment-scoped rerun would leave that tab showing the previous one.
     """
-    import streamlit as st
-    if PlaybackController.supports_fragment_scope():
-        st.rerun(scope="fragment")
-    else:
-        st.rerun()
+    SESSION.refresh()
 
 
 def _state(defaults: Dict[str, Any]) -> None:
@@ -78,7 +82,7 @@ def _apply_preset(key: str) -> None:
     import streamlit as st
     for k, v in PRESETS[key]["state"].items():
         st.session_state[k] = v
-    pb = st.session_state.get("_live_state")
+    pb = st.session_state.get(SESSION.PLAYBACK_STATE_KEY)
     if pb is not None:
         pb.frame_idx = 0
         pb.playing = True
@@ -99,12 +103,19 @@ def _left_rail(scenarios, n_frames_default: int) -> Dict[str, Any]:
     import streamlit as st
 
     UI.rail_heading("Scene")
+    # Scenario, frame count and the MOS gate decide WHICH RUN is loaded, so
+    # they are shared with the Scene demo tab. Each tab keys its own widget
+    # — Streamlit refuses a duplicate key even across tabs — and both read
+    # and write one session slot.
+    SESSION.pull("drive_scenario", SESSION.SCENARIO_KEY, "mixed_urban")
     scenario = st.selectbox("Scenario", scenarios, key="drive_scenario",
                             label_visibility="collapsed")
+    SESSION.push("drive_scenario", SESSION.SCENARIO_KEY)
     c1, c2 = st.columns(2)
     with c1:
-        n_frames = st.slider("Frames", 6, 24, n_frames_default,
-                             key="drive_n_frames")
+        SESSION.pull("drive_n_frames", SESSION.N_FRAMES_KEY, n_frames_default)
+        n_frames = st.slider("Frames", 6, 24, key="drive_n_frames")
+        SESSION.push("drive_n_frames", SESSION.N_FRAMES_KEY)
     with c2:
         zoom = st.slider("Zoom", 0.5, 2.5, 1.0, 0.1, key="drive_zoom")
     frame_ref = st.radio("View frame", CAM.FRAME_CHOICES,
@@ -144,10 +155,12 @@ def _left_rail(scenarios, n_frames_default: int) -> Dict[str, Any]:
             _refresh()
 
     with st.expander("Advanced", expanded=False):
+        SESSION.pull("drive_gate", SESSION.GATE_KEY, True)
         st.checkbox("MOS gate", key="drive_gate",
                     help="OFF writes moving points into the persistent map. "
                          "Both variants are pre-computed, so this is "
                          "instant — it is an ablation, not a setting.")
+        SESSION.push("drive_gate", SESSION.GATE_KEY)
         st.checkbox("Predicted path", key="drive_predict",
                     help="2 s constant-velocity extrapolation of a MOVING "
                          "track. Not a prediction model.")
@@ -245,9 +258,18 @@ def render_live_demo(precompute_fn: Callable[..., Any],
     })
 
     interval = None
-    pb0 = st.session_state.get("_live_state")
+    pb0 = st.session_state.get(SESSION.PLAYBACK_STATE_KEY)
     if pb0 is not None and getattr(pb0, "playing", False):
-        interval = pb0.interval_s()
+        # Never schedule faster than this tab can actually redraw. A
+        # `run_every` shorter than the render queues reruns behind each
+        # other, and the browser then receives payloads out of order — the
+        # frame counter appears to walk backwards even though the state
+        # machine is strictly monotonic. The frame is derived from the
+        # clock, so a slower timer skips frames rather than slowing the
+        # scene down.
+        interval = max(pb0.interval_s(), MIN_REDRAW_S)
+    PROFILE.log("arm", f"live interval={interval} "
+                       f"playing={getattr(pb0, 'playing', None)}")
 
     if PlaybackController.supports_fragments():
         frag = st.fragment(run_every=interval)(_workspace)
@@ -277,14 +299,22 @@ def _workspace(precompute_fn: Callable[..., Any],
                     f"({opt['n_frames']} frames, both MOS variants)…"):
         run_on = precompute_fn(opt["scenario"], opt["n_frames"], True)
         run_off = precompute_fn(opt["scenario"], opt["n_frames"], False)
-    run = run_on if st.session_state["drive_gate"] else run_off
+    run = run_on if st.session_state[SESSION.GATE_KEY] else run_off
     n = len(run)
     if n == 0:
         with centre:
             st.warning("No frames for this scenario.")
         return
 
-    pb = PlaybackController.bind(n, key="live")
+    pb = PlaybackController.bind(n, key="live",
+                                 state_key=SESSION.PLAYBACK_STATE_KEY)
+    # Advance BEFORE choosing the frame, not after drawing it.
+    # The index is a function of the clock, so each tab renders
+    # whatever is current at its own render moment. Doing it last
+    # meant rendering the value the other tab's ticker happened to
+    # leave behind, which made the displayed frame jump backwards
+    # whenever the two fragments got out of step.
+    pb.tick_if_playing()
     idx = min(pb.state.frame_idx, n - 1)
     snap = run.frames[idx]
 
@@ -351,12 +381,8 @@ def _workspace(precompute_fn: Callable[..., Any],
         scene_diagnostics(run, run_on, run_off, snap, idx,
                           result.corridor_area, result.drawn_objects)
 
-    # Advance LAST, after everything this frame has been drawn.
-    pb.tick_if_playing()
-    if _PROFILE:
-        import time as _t
-        print(f"[frag] {(_t.perf_counter() - _t0) * 1000:7.1f} ms  "
-              f"frame {idx}", flush=True)
+    PROFILE.log("frag", f"{(_t.perf_counter() - _t0) * 1000:7.1f} ms  "
+                        f"frame {idx}")
 
 
 def _metrics_strip(run, snap, result, idx: int) -> None:

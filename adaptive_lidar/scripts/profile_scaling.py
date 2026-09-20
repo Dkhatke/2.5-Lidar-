@@ -2,11 +2,17 @@
 profile_scaling.py — per-stage latency vs point count.
 
 Runs the full S0-S9 pipeline on synthetic clouds of increasing size and
-records per-stage wall time.  Used to produce docs/perf_baseline.csv
-(Phase 0) and docs/perf_phase1.csv (Phase 1).
+records per-stage wall time.
+
+``docs/perf_baseline.csv`` is the PHASE 0 measurement — the 4,247 ms/frame
+the whole speed-up claim in RESULTS.md is stated against. It is historical
+evidence, not something to regenerate: running this script with the
+default output used to overwrite it with current numbers, which quietly
+turned "4,247 -> 365 ms" into "365 -> 365 ms". The default now writes
+somewhere harmless, and clobbering the baseline takes an explicit path.
 
 Usage:
-    python scripts/profile_scaling.py --out docs/perf_baseline.csv
+    python scripts/profile_scaling.py                      # -> perf_current.csv
     python scripts/profile_scaling.py --out docs/perf_phase1.csv --frames 5
 """
 from __future__ import annotations
@@ -61,7 +67,10 @@ def _make_cloud(n_target: int, rng: np.random.Generator):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="docs/perf_baseline.csv")
+    ap.add_argument("--out", default="docs/perf_current.csv",
+                    help="Where to write. NOT perf_baseline.csv by "
+                         "default: that file is the Phase 0 measurement "
+                         "every speed-up number is quoted against.")
     ap.add_argument("--frames", type=int, default=3,
                     help="frames per size (first frame discarded as warm-up)")
     ap.add_argument("--budget", type=float, default=0.8)
