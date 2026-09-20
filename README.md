@@ -17,7 +17,7 @@ pip install -r adaptive_lidar/requirements.txt
 
 cd adaptive_lidar
 python main.py --demo                 # the pipeline, end to end
-streamlit run app.py                  # the dashboard (see the ★ Drive tab)
+streamlit run app.py                  # FOVEA — opens on the Live demo tab
 ```
 
 No data download, no configuration, no GPU. The synthetic sensor model and the
@@ -39,7 +39,7 @@ python scripts/run_baselines.py && python scripts/generate_report.py
 | **M2** | terrain analysis: drivable / caution / blocked | `AdaptiveMap.traversability()` — slope, roughness, step, clearance, class, per vehicle profile |
 | **M3** | static obstacles and dynamic objects as tracked instances | `perception/tracking.py`, three track states |
 | **M4** | cell size grows with distance, **no alignment error or data loss** | `mapping/adaptive_map.py`; proved by `scripts/test_map.py` |
-| **M5** | dashboard, distinct terrain/object colours, measured memory reduction | `app.py` |
+| **M5** | dashboard, distinct terrain/object colours, measured memory reduction | `app.py` + `visualization/live_demo.py` — click any cell for all 21 stored fields |
 | **M6** | latency p50/p95/p99 and **accuracy stratified by range** | `evaluation/metrics.py`, every table in the report |
 
 ---
@@ -84,7 +84,8 @@ python scripts/test_map.py                 # M4: alignment and aggregation
 python scripts/test_allocation.py          # retention vs budget
 python scripts/test_temporal.py            # the MOS gate
 python scripts/eval_semantic.py            # M1/M6: per-class IoU by range
-python -m pytest tests/ -q                 # 63 tests
+python scripts/test_interaction.py         # click -> cell, on a real run
+python -m pytest tests/ -q                 # 167 tests
 ```
 
 Selected measured outcomes:
@@ -113,6 +114,32 @@ Selected measured outcomes:
   0.0123 → 0.0080 after temperature scaling, 28.6 ms for 55k points on CPU.
 * **Speed-up over the previous implementation:** 4,247 → ~300 ms per frame at
   120k points (24× at 8k, 22× at 30k, 13× at 120k).
+
+### The dashboard
+
+`streamlit run app.py` opens on **Live demo**: a scene you can drive, with a
+compact control rail on the left, a clickable map in the middle and a cell
+inspector on the right.
+
+* **Click any cell** and the inspector opens all 21 stored fields in eight
+  sections — identity and Morton address, terrain and the traversability
+  verdict with its reason, the full six-class posterior rather than the
+  argmax, occupancy, dynamics, sensor and intensity, flags, and a named raw
+  table. Clicking a tracked object opens the track instead, with a link down
+  to the cell beneath it. The hit test resolves to the *finest* cell
+  covering the point; `scripts/test_interaction.py` checks 1,196 clicks
+  across three cameras and gets the right cell every time.
+* **Playback** is an `st.fragment`, not a sleep loop: the controls stay live
+  while it runs, and advancing a frame never re-enters the pipeline. The
+  rate on screen is labelled a replay rate — it is bounded by drawing the
+  canvas, not by perception.
+* Two more tabs hold the engineering work: **Research & evaluation** (the
+  equal-memory comparison, range-stratified accuracy, per-stage latency) and
+  **Debug & cell inspector** (query the live map by coordinate).
+
+Everything on screen states what it is: the header carries a *synthetic /
+demo data* badge and the actual configured backend, and every metric block
+repeats that these are demo-pipeline numbers, not deployment claims.
 
 ### Where it falls short
 
@@ -154,7 +181,7 @@ adaptive_lidar/
   data/       raycast sensor model, loader, label maps
   utils/      grouping, spatial index, range image, voxel hash
   scripts/    profiling, training, verification, baselines, report
-  tests/      63 tests
+  tests/      167 tests
   models/     the trained weights
   docs/       RESULTS.md, ARCHITECTURE.md, figures, CSVs
 PROGRESS.md   the working log, with pasted verification output

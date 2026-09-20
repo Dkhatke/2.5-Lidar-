@@ -192,6 +192,72 @@ def draw_overlay_points(img, project, pts, rgb=(235, 30, 70), radius=1):
 
 
 # ════════════════════════════════════════════════════════════
+# Selection highlight
+# ════════════════════════════════════════════════════════════
+SELECT_RGB = (255, 214, 10)
+SELECT_DARK = (40, 34, 0)
+
+
+def draw_cell_highlight(img, project, cx, cy, size, *, rgb=SELECT_RGB,
+                        min_px=9):
+    """Outline the selected cell, at its TRUE size where that is visible.
+
+    A 5 cm cell at 7 px/m is a third of a pixel, so an outline drawn at true
+    size would be invisible and the user would think the click missed. Below
+    ``min_px`` the marker is grown to a fixed size and the inspector states
+    the real dimension — enlarging the drawn box is a readability choice, and
+    the number next to it stays honest.
+    """
+    half = float(size) / 2.0
+    corners = np.array([[cx - half, cy - half], [cx + half, cy - half],
+                        [cx + half, cy + half], [cx - half, cy + half]],
+                       np.float32)
+    px, py = project(corners)
+    w = max(px.max() - px.min(), py.max() - py.min())
+    if w < min_px:
+        c0x, c0y = project(np.array([[cx, cy]], np.float32))
+        h = min_px // 2
+        px = np.array([c0x[0] - h, c0x[0] + h, c0x[0] + h, c0x[0] - h])
+        py = np.array([c0y[0] - h, c0y[0] - h, c0y[0] + h, c0y[0] + h])
+    pts = list(zip(px.tolist(), py.tolist()))
+    # Dark underlay first, so the marker reads on both pale and bright cells.
+    _polyline(img, [(a + 1, b + 1) for a, b in pts], SELECT_DARK, width=3)
+    _polyline(img, pts, rgb, width=2)
+    return img
+
+
+def draw_crosshair(img, project, x, y, *, rgb=SELECT_RGB, arm=11, gap=4):
+    """Where the click landed, as distinct from what it selected.
+
+    Worth drawing separately: when a click near an object selects the object
+    rather than the cell under the cursor, seeing both marks is what makes
+    the hit-priority rule legible instead of surprising.
+    """
+    cx, cy = project(np.array([[x, y]], np.float32))
+    cx, cy = int(cx[0]), int(cy[0])
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        _line(img, (cx + dx * gap, cy + dy * gap),
+              (cx + dx * arm, cy + dy * arm), rgb, width=1)
+    return img
+
+
+def draw_object_highlight(img, project, obj, *, rgb=SELECT_RGB):
+    """A halo around the selected object's box."""
+    c = obj["centroid_world"]
+    ext = obj["extent"]
+    lx = float(max(ext[0], 0.6)) + 0.9
+    ly = float(max(ext[1], 0.6)) + 0.9
+    v = obj["vel_world"]
+    yaw = float(np.arctan2(v[1], v[0])) if obj["speed_world"] > 0.4 else 0.0
+    px, py = project(_rect_corners(c[0], c[1], lx, ly, yaw))
+    pts = list(zip(px.tolist(), py.tolist()))
+    if len(pts) == 4:
+        _polyline(img, pts, SELECT_DARK, width=3)
+        _polyline(img, pts, rgb, width=2, dash=4)
+    return img
+
+
+# ════════════════════════════════════════════════════════════
 # D — the swept corridor
 # ════════════════════════════════════════════════════════════
 def draw_corridor(img, project, corridor, upto_frame, alpha=0.45):

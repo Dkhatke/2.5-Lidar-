@@ -952,3 +952,188 @@ a synthesised perspective. If a 3D viewer is wanted, that is Part 2 and it
 was never specified.
 
 ---
+
+## PHASE 12 — INTERACTIVE WORKSPACE (FOVEA UI) ✅
+
+The dashboard was an engineering readout with a `number_input` where a click
+should be, and a playback loop built from `time.sleep`. Three things were
+actually broken, and each is fixed by a new module rather than by patching
+`app.py`:
+
+| broken | why it mattered | fixed by |
+|---|---|---|
+| no click-to-select — x/y typed into two number boxes | you cannot ask a question about a cell you cannot point at | `coordinate_transform.py` + `selection.py` + `interactive_map.py` |
+| playback was `time.sleep` + a whole-app `st.rerun` | blocks the server thread, swallows clicks, and re-executes the whole script — a cache miss would run perception once per displayed frame | `playback_controller.py`, an `st.fragment` with `run_every` |
+| the engineering dashboard was the first thing on screen | the demo was the fifth tab | `ui_layout.py`, `live_demo.py`, three tabs with Live demo first |
+
+### The inverse projection
+
+`overlays.make_projector` is the forward transform the renderer draws
+through. `coordinate_transform.ViewTransform` is its exact inverse, and it
+inverts the whole chain: the display flip (`st.image(np.flipud(img))`), the
+pixel scale, the camera rotation about the view centre, and the vehicle
+frame's translation and heading.
+
+It is a frozen value object rather than a reference to the live camera,
+because a click arrives on the *next* Streamlit run, by which time the
+camera may have moved; the transform that produced the clicked pixels is the
+one that has to answer.
+
+Measured by `scripts/test_interaction.py` on a real precomputed run:
+
+```
+1. inverse projection round-trip
+   top-follow   World    max error  0.0000 mm   ok
+   top-follow   Vehicle  max error  0.0000 mm   ok
+   chase        World    max error  0.0000 mm   ok
+   chase        Vehicle  max error  0.0000 mm   ok
+   world-fixed  World    max error  0.0000 mm   ok
+   (five presets x two frames, all ok)
+   worst across every camera: 0.0000 mm (a pixel is 143 mm at the default zoom)
+
+2. click a real cell -> the same cell
+   top-follow   World    398/398 exact (100.0%), 2 off screen   ok
+   chase        World    400/400 exact (100.0%), 0 off screen   ok
+   chase        Vehicle  398/398 exact (100.0%), 2 off screen   ok
+
+3. the finest cell covering the point is the one returned
+   600 points checked, 0 returned a coarser cell than one that existed   ok
+
+4. clicking a tracked object selects the object
+   36 of 36 on-screen tracks   ok
+```
+
+A round-trip test alone would pass on a transform that is self-consistently
+wrong, so `tests/test_coordinate_transform.py` also compares the forward
+half against `overlays.make_projector` — the projector the pixels actually
+came from — at every camera and in both frames.
+
+One detail that is easy to get wrong and invisible when you do:
+`streamlit-image-coordinates` reports `event.offsetX` on the `<img>`
+element, which is in **displayed** pixels. At `width="stretch"` the 840 px
+canvas is laid out at about 721 px, so an uncorrected click is pulled ~14%
+towards the left of the map — plausible, and wrong. `scale_click` divides by
+the displayed size the component reports and multiplies by the natural size.
+
+### Selection
+
+Lookup runs against the per-frame **cache**, not the live map:
+`AdaptiveMap.cell_at` only exists for the last frame, and a click while
+scrubbing at frame 4 has to answer with frame 4's values. Each level is
+indexed lazily as a sorted packed-key array queried with `searchsorted` (a
+Python dict of 118k cells costs more than the whole render), memoised on the
+cached frame so scrubbing back and forth does not rebuild it.
+
+Hit priority is object, then cell, then empty space, with objects matched in
+**screen** pixels: an object at 60 m is a few pixels across, and a
+metre-based radius would make it unhittable while making near objects
+greedy.
+
+An object's "underlying cell" needed care. An exact lookup at the centroid
+fails for **18 of the 30** tracked objects on frame 0 of `mixed_urban` — not
+because the map lost them, but because a LiDAR sees the surfaces of a car
+and not the middle of it, so the centroid lands in the object's own
+occlusion shadow. The nearest mapped surface within 1.5 m is reported
+instead, with the offset stated on screen. The first version of this panel
+said "its points were gated out of the persistent map", which is the wrong
+explanation for a stationary car; it was corrected.
+
+### The frame cache
+
+Extended from 12 fields to every `MapCell` field plus the full six-class
+posterior, because the inspector is driven entirely from the cache:
+
+```
+118,043 cells/frame, 3.31 MB/frame, 26.5 MB for 8 frames
+```
+
+`intensity_var` and `observability` had to be added to both array builders
+in `adaptive_map.py`; they were stored but never exposed.
+
+### The inspector
+
+Eight sections — Identity, Terrain and geometry, Semantics, Occupancy,
+Dynamics, Sensor and intensity, Flags, Raw/debug — with probabilities drawn
+as bars and derived quantities labelled as derived. Slope, step, obstacle
+height and the traversability verdict are computed from the cached frame's
+neighbours using the map's own thresholds, so the same map still answers
+differently for a wheeled and a tracked vehicle.
+
+Two honesty fixes went in here:
+
+* the field the map calls `penetration` is `return_number / return_count`,
+  which is **1.0 for a single return**. Printed under that word it reads
+  exactly backwards, so it is shown as a return-position ratio with the
+  meaning spelled out, and a test fails if the bare label comes back.
+* the Raw/debug panel states that cached values are byte-packed and
+  therefore good to about 1/255 of their range, not to float precision.
+
+### Playback
+
+`st.fragment(run_every=...)` with `st.rerun(scope="fragment")`. Both exist in
+the installed Streamlit (1.64) and both are **probed** rather than assumed —
+on an older build the transport still works, it just does not auto-advance.
+
+Two subtleties, each of which cost a debugging cycle:
+
+* `run_every` is fixed when the fragment is **decorated**, which happens in
+  the enclosing script run. Play and pause therefore have to rerun the
+  *app*, or the timer keeps its old schedule and the button appears to do
+  nothing at all. Everything else stays fragment-scoped and never re-enters
+  the pipeline.
+* a fragment reruns for two reasons — the timer, and a widget inside it —
+  and Streamlit does not say which. Without a wall-clock gate on the tick,
+  dragging the timeline during playback also steals a frame.
+
+Measured redraw cost, `FOVEA_PROFILE=1`, 12-frame `mixed_urban`:
+
+```
+[frag]    95.6 ms  frame 1        compose 56 ms + PNG encode 10-35 ms
+[frag]    97.0 ms  frame 5
+[frag]   104.9 ms  frame 8
+[frag]   100.9 ms  frame 11
+```
+
+End to end, including the browser round trip, playback settles near **2
+frames per second** whatever the speed selector says. That is stated on
+screen next to the transport, and it is called a replay rate — it says
+nothing about pipeline latency.
+
+### Layout
+
+Two layout bugs were found by looking at the rendered page rather than at
+the code:
+
+* the page title was invisible. Streamlit's toolbar is 60 px tall, opaque
+  and absolutely positioned at the top of the page; `.block-container
+  {padding-top: 1.1rem}`, inherited from the first dashboard, tucked the
+  first element underneath it. Now 4.4rem.
+* the click component sizes its iframe from the image's **natural** height,
+  then the browser scales the image down to the column width — leaving a
+  band of dead space and a scrollbar. The aspect ratio is known at render
+  time, so it is pinned.
+
+The side rails are height-capped with their own scroll: Streamlit stretches
+every column in a row to the tallest one, so a control rail that grew past
+the canvas opened ~350 px of dead space and pushed the transport off the
+bottom of the screen.
+
+### Tests
+
+63 to **167**, all passing.
+
+| file | what it protects |
+|---|---|
+| `tests/test_coordinate_transform.py` (28) | round-trip at every camera and frame, agreement with the renderer's own projector, the display flip, zoom |
+| `tests/test_selection.py` (25) | containment at all five levels, finest-cell-wins, negative coordinates, click to cell, object priority, selection persistence across frames, the nearest-surface fallback |
+| `tests/test_playback_controller.py` (27) | stepping, wrapping, scrub-does-not-pause, the tick gate, and two guards: the transport imports nothing from the pipeline, and `time.sleep` cannot come back anywhere in `visualization/` |
+| `tests/test_inspector.py` (24) | every `MapCell` field reaches a section, all eight sections render in order, no raw array dump, the verdict matches the map's own thresholds, and the `penetration` label |
+| `scripts/test_interaction.py` | the four claims above, on a real precomputed run |
+
+### Not done
+
+**No 3D scene view.** The brief made it optional and said not to destabilise
+the mapping code for it. The visualisation layer is split so that a Three.js
+renderer could replace `interactive_map.render_canvas` without touching
+selection, the inspector or the transport, because all three go through
+`ViewTransform` rather than through pixels.

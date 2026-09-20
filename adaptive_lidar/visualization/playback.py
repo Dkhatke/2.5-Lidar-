@@ -54,21 +54,40 @@ CORRIDOR_RES = 0.4
 #: Levels that count as "resolved finely" for the corridor.
 CORRIDOR_LEVELS = (0, 1)
 
-#: Stored per cached frame, in the narrowest dtype that still draws
-#: correctly. `size` is omitted because it is a pure function of `level`, and
-#: the difference between 45 and 20 bytes per cell is the difference between
-#: a 100 MB session and a 25 MB one once both MOS variants are cached.
+#: Stored per cached frame, in the narrowest dtype that still draws and
+#: inspects correctly. `size` is omitted because it is a pure function of
+#: `level`.
+#:
+#: The list is everything ``MapCell`` carries, because the inspector is
+#: driven entirely from the cache — the live AdaptiveMap only exists for the
+#: last frame, and a click on frame 4 has to answer with frame 4's values.
 CELL_FIELDS = ("cx", "cy", "level", "sem_class", "ground_z", "z_max",
-               "n_points", "entropy", "occupancy_state", "dynamic_prob",
-               "intensity_mean", "last_seen")
+               "overhead_clearance", "z_var", "n_points", "entropy",
+               "occupancy_state", "occupancy_logodds", "dynamic_prob",
+               "intensity_mean", "intensity_var", "penetration",
+               "observability", "flags", "last_seen")
+
+#: The full 6-class distribution, so the inspector can show the real
+#: distribution rather than the argmax. Six bytes per cell.
+EVIDENCE_FIELD = "sem_prob"
 
 _CELL_DTYPE = {
     "cx": np.float32, "cy": np.float32, "level": np.int8,
     "sem_class": np.int8, "ground_z": np.float16, "z_max": np.float16,
-    "n_points": np.uint16, "occupancy_state": np.int8, "last_seen": np.uint16,
+    "overhead_clearance": np.float16, "z_var": np.float16,
+    "n_points": np.uint16, "occupancy_state": np.int8,
+    "occupancy_logodds": np.float16, "flags": np.uint8,
+    "last_seen": np.uint16,
 }
-#: These three are 0..1 and only ever feed a colour ramp, so a byte is plenty.
-_CELL_U8 = ("entropy", "dynamic_prob", "intensity_mean")
+#: These are 0..1 and only ever feed a colour ramp or a readout, so a byte is
+#: plenty. `intensity_var` and `penetration` are 0..0.5 and 0..1 respectively
+#: in the map's own packing, and are re-normalised on decode.
+_CELL_U8 = ("entropy", "dynamic_prob", "intensity_mean", "intensity_var",
+            "penetration", "observability")
+
+
+#: Fields whose byte packing spans something other than 0..1.
+_U8_RANGE = {"intensity_var": 0.5}
 
 
 def decode_cells(cells: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -76,10 +95,33 @@ def decode_cells(cells: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     out = dict(cells)
     for k in _CELL_U8:
         if k in out and out[k].dtype == np.uint8:
-            out[k] = out[k].astype(np.float32) / 255.0
-    for k in ("ground_z", "z_max"):
+            out[k] = out[k].astype(np.float32) / 255.0 * _U8_RANGE.get(k, 1.0)
+    if EVIDENCE_FIELD in out and out[EVIDENCE_FIELD].dtype == np.uint8:
+        ev = out[EVIDENCE_FIELD].astype(np.float32) / 255.0
+        out[EVIDENCE_FIELD] = ev / np.maximum(ev.sum(axis=1, keepdims=True),
+                                              1e-9)
+    for k in ("ground_z", "z_max", "overhead_clearance", "z_var",
+              "occupancy_logodds"):
         if k in out:
             out[k] = out[k].astype(np.float32)
+    return out
+
+
+def cell_record(cells: Dict[str, np.ndarray], row: int) -> Dict[str, object]:
+    """One cached cell as a plain dict, decoded, for the inspector.
+
+    Kept here rather than in the UI so that the packing stays private to this
+    module: the inspector should not need to know that intensity variance was
+    stored as a byte over 0..0.5.
+    """
+    d = decode_cells(cells)
+    out: Dict[str, object] = {}
+    for k, v in d.items():
+        if k == EVIDENCE_FIELD:
+            out["evidence"] = np.asarray(v[row], np.float32)
+        elif isinstance(v, np.ndarray) and v.ndim == 1 and len(v) > row:
+            out[k] = v[row].item() if v.dtype.kind in "fiub" else v[row]
+    out["resolution"] = float(out.get("size", 0.0))
     return out
 
 
@@ -163,6 +205,10 @@ def _clip_cells(a: Dict[str, np.ndarray], ego: Tuple[float, float]
         else:
             out[k] = v.astype(_CELL_DTYPE.get(k, v.dtype), copy=False)
     # `size` is reconstructed from `level` at draw time.
+    if "sem_prob" in a:
+        out[EVIDENCE_FIELD] = np.clip(
+            np.asarray(a["sem_prob"], np.float32)[keep] * 255.0,
+            0, 255).astype(np.uint8)
     out["size"] = ResolutionLevel.sizes_array()[
         np.clip(out["level"].astype(np.int64), 0, 4)]
     return out

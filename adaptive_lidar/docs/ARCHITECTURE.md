@@ -247,13 +247,50 @@ adaptive_lidar/
   visualization/
     render.py              map -> image, including a rotated camera
     camera.py              frames of reference and the five presets
-    overlays.py            ego, object boxes by state, corridor, age tint
-    playback.py            pre-compute + cache, swept corridor, wall probe
-    drive_tab.py           the Drive tab
-  scripts/                 profiling, training, the four verifications,
+    overlays.py            ego, object boxes by state, corridor, age tint,
+                           the selection highlight
+    playback.py            pre-compute + cache (every MapCell field),
+                           swept corridor, wall probe
+    coordinate_transform.py  screen <-> world; the EXACT inverse of the
+                           renderer's projector
+    selection.py           click -> object | cell | empty, finest cell wins
+    interactive_map.py     the clickable canvas and its click scaling
+    inspector.py           the eight-section cell and object inspectors
+    playback_controller.py the transport; no Streamlit in the state machine
+    ui_layout.py           header, status badges, CSS, metrics strip
+    live_demo.py           the Live demo tab (one st.fragment)
+    drive_tab.py           scene presets + the diagnostics panel
+  scripts/                 profiling, training, the five verifications,
                            baselines, report generation
-  tests/                   63 tests, including the gt-isolation guard
+  tests/                   167 tests, including the gt-isolation guard
 ```
+
+---
+
+## The dashboard
+
+Three tabs: **Live demo** (default), **Research & evaluation**, **Debug &
+cell inspector**. The demo is first because the engineering readout answers
+the second question a reviewer has, not the first.
+
+The Live demo is one `st.fragment`. Everything inside it reads the playback
+cache, so advancing a frame, changing the camera or clicking a cell
+re-executes only that function — the pipeline lives above it behind
+`st.cache_resource` and is never re-entered. With `run_every` set while
+playing, the same mechanism animates the scene, which is why there is no
+`time.sleep` anywhere in `visualization/` and a test enforces that.
+
+Clicking is real. `coordinate_transform.ViewTransform` is the exact inverse
+of `overlays.make_projector` — it undoes the display flip, the pixel scale,
+the camera rotation and the vehicle frame — and `selection.py` resolves the
+resulting world point to the finest cached cell containing it, with tracked
+objects taking priority. `scripts/test_interaction.py` verifies the
+round-trip and the click on a real precomputed run.
+
+The replay rate on screen is a replay rate. It is bounded by drawing and
+shipping the canvas (~95 ms of server time per displayed frame, ~460 ms end
+to end), and it says nothing about pipeline latency, which is reported
+separately and stratified by range.
 
 ---
 
