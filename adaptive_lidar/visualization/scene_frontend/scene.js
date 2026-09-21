@@ -37,8 +37,13 @@
 // ─────────────────────────────────────────────────────────────
 var S = {
   renderer: null, scene: null, camera: null,
-  cellMesh: null, cellCapacity: 0, cellXY: null,
-  pointCapacity: 0,
+  // The run's geometry, sent once and kept here. Streamlit re-sends an
+  // element's args on every rerun, so the payload arrives only when it
+  // changed and is null otherwise — this is the copy that is drawn from.
+  run: null, view: null,
+  flatMesh: null, flatCapacity: 0, flatIdx: null,
+  boxMesh: null, boxCapacity: 0, boxIdx: null,
+  cellXY: null, pointCapacity: 0,
   objectGroup: null, egoGroup: null, ringGroup: null, pointCloud: null,
   markerGroup: null,
   objects: [], labels: [], ringLabels: [],
@@ -47,7 +52,7 @@ var S = {
   // move the camera: the payload changes every displayed frame and the
   // view must not jump with it.
   orbit: { yaw: -2.35, pitch: 0.62, dist: 68, target: [0, 0, 0] },
-  drag: null, moved: 0, lastArgs: null, width: 0, height: 520,
+  drag: null, moved: 0, width: 0, height: 520,
   needsRender: true, hoverName: null,
 };
 
@@ -147,15 +152,12 @@ function guardContext() {
     EMPTY.style.display = "flex";
   }, false);
   el.addEventListener("webglcontextrestored", function () {
-    S.cellMesh = null; S.cellCapacity = 0;
+    S.flatMesh = null; S.flatCapacity = 0;
+    S.boxMesh = null; S.boxCapacity = 0;
     S.pointCloud = null; S.pointCapacity = 0;
     GEO_CACHE = {};
     EMPTY.style.display = "none";
-    if (S.lastArgs) {
-      buildCells(S.lastArgs); buildObjects(S.lastArgs);
-      buildEgo(S.lastArgs); buildRings(S.lastArgs);
-      buildPoints(S.lastArgs); buildMarker(S.lastArgs);
-    }
+    if (S.view) drawView(S.view);
     S.needsRender = true;
   }, false);
 }
@@ -319,11 +321,24 @@ function pick(e) {
     if (o) return { kind: "object", id: o.userData.objectId,
                     name: o.userData.label };
   }
-  if (S.cellMesh) {
-    var hitCell = ray.intersectObject(S.cellMesh, false)[0];
-    if (hitCell && hitCell.instanceId !== undefined) {
-      var i = hitCell.instanceId;
-      return { kind: "cell", x: S.cellXY[2 * i], y: S.cellXY[2 * i + 1] };
+  var c = S.cellXY;
+  if (c) {
+    var meshes = [];
+    if (S.flatMesh && S.flatMesh.count) meshes.push([S.flatMesh, S.flatIdx]);
+    if (S.boxMesh && S.boxMesh.count) meshes.push([S.boxMesh, S.boxIdx]);
+    var best = null, bestMap = null;
+    for (var k = 0; k < meshes.length; k++) {
+      var hit = ray.intersectObject(meshes[k][0], false)[0];
+      if (hit && hit.instanceId !== undefined &&
+          (!best || hit.distance < best.distance)) {
+        best = hit; bestMap = meshes[k][1];
+      }
+    }
+    if (best) {
+      var j = bestMap[best.instanceId];
+      return { kind: "cell",
+               x: c.ox + c.xy[2 * j] * 0.01,
+               y: c.oy + c.xy[2 * j + 1] * 0.01 };
     }
   }
   return { kind: "empty" };
@@ -382,105 +397,190 @@ function hoverTest(e) {
  * Now the mesh is allocated once at a capacity that only ever grows, and a
  * frame just overwrites the buffers it already owns and sets `count`.
  */
-function ensureCellMesh(capacity) {
-  if (S.cellMesh && S.cellCapacity >= capacity) return S.cellMesh;
+/*
+ * TWO reused meshes, never rebuilt.
+ *
+ * Most map cells are ground: base and top within a couple of centimetres
+ * of each other. Drawing those as boxes costs twelve triangles each to
+ * show a surface that two would show, so they go into a flat instanced
+ * quad and only the cells with real vertical extent get a box.
+ *
+ * Both are allocated once at a capacity that only grows. This used to
+ * dispose and rebuild the mesh every frame: at 18,000 cells that is
+ * 1.15 MB of instance matrices plus 216 kB of colours allocated,
+ * uploaded and thrown away several times a second — enough GPU churn to
+ * stall an integrated driver and lose the WebGL context, which is what
+ * turned the canvas white.
+ */
+var FLAT_MAX_H = 0.06;      // metres of extent below which a cell is flat
 
-  if (S.cellMesh) {
-    S.scene.remove(S.cellMesh);
-    S.cellMesh.geometry.dispose();
-    S.cellMesh.material.dispose();
-  }
-  // Grow in steps so a scene that drifts a few cells larger each frame
-  // does not reallocate on every one of them.
-  var cap = Math.max(1024, Math.ceil(capacity * 1.35));
+function makeCellMesh(geo, capacity) {
   var mesh = new THREE.InstancedMesh(
-    new THREE.BoxBufferGeometry(1, 1, 1),
-    new THREE.MeshLambertMaterial({}), cap);
+    geo, new THREE.MeshLambertMaterial({}), capacity);
   mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  // Touch setColorAt once so three allocates the instanceColor attribute;
-  // after this the array is written directly.
   mesh.setColorAt(0, new THREE.Color(1, 1, 1));
   mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
-  mesh.frustumCulled = false;
-  S.cellMesh = mesh;
-  S.cellCapacity = cap;
-  S.scene.add(mesh);
+  // Culled against a bounding sphere we maintain ourselves: three cannot
+  // derive one from instance matrices, and leaving it unculled means the
+  // whole grid is submitted even when the camera faces away from it.
+  mesh.frustumCulled = true;
+  mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e-3);
   return mesh;
 }
 
-function buildCells(args) {
-  var c = args.cells;
-  if (!c || !c.n) {
+function ensureCellMeshes(nFlat, nBox) {
+  if (!S.flatMesh || S.flatCapacity < nFlat) {
+    if (S.flatMesh) {
+      S.scene.remove(S.flatMesh);
+      S.flatMesh.geometry.dispose();
+      S.flatMesh.material.dispose();
+    }
+    S.flatCapacity = Math.max(1024, Math.ceil(nFlat * 1.35));
+    // A plane lying in the ground plane: two triangles instead of twelve.
+    var quad = new THREE.PlaneBufferGeometry(1, 1);
+    quad.rotateX(-Math.PI / 2);
+    S.flatMesh = makeCellMesh(quad, S.flatCapacity);
+    S.scene.add(S.flatMesh);
+  }
+  if (!S.boxMesh || S.boxCapacity < nBox) {
+    if (S.boxMesh) {
+      S.scene.remove(S.boxMesh);
+      S.boxMesh.geometry.dispose();
+      S.boxMesh.material.dispose();
+    }
+    S.boxCapacity = Math.max(512, Math.ceil(nBox * 1.35));
+    S.boxMesh = makeCellMesh(
+      new THREE.BoxBufferGeometry(1, 1, 1), S.boxCapacity);
+    S.scene.add(S.boxMesh);
+  }
+}
+
+/** Decode one frame's packed cell arrays, once, and keep them. */
+function decodeCells(c) {
+  if (!c || !c.n) return null;
+  if (c._d) return c._d;
+  c._d = {
+    n: c.n,
+    xy: b64(c.xy, Int16Array),
+    zcm: b64(c.zcm, Int16Array),
+    lvl: b64(c.level, Uint8Array),
+    cls: b64(c.cls, Uint8Array),
+    trav: b64(c.trav, Uint8Array),
+    ret: b64(c.returns, Uint8Array),
+    span: b64(c.span, Uint16Array),
+    ox: c.origin[0], oy: c.origin[1],
+    sizes: c.sizes, zRange: c.zRange,
+  };
+  return c._d;
+}
+
+function buildCells(view) {
+  var c = decodeCells(view.cells);
+  if (!c) {
     S.cellXY = null;
-    if (S.cellMesh) S.cellMesh.count = 0;
+    if (S.flatMesh) S.flatMesh.count = 0;
+    if (S.boxMesh) S.boxMesh.count = 0;
     return;
   }
 
-  var n = c.n;
-  var xy = b64(c.xy, Float32Array);
-  var zcm = b64(c.zcm, Int16Array);
-  var lvl = b64(c.level, Uint8Array);
-  var cls = b64(c.cls, Uint8Array);
-  var trav = b64(c.trav, Uint8Array);
-  var ret = b64(c.returns, Uint8Array);
-  S.cellXY = xy;
+  var n = c.n, xy = c.xy, zcm = c.zcm, lvl = c.lvl;
+  var hs = view.heightScale;
+  var gap = view.showGrid ? 0.88 : 1.0;
 
-  var mesh = ensureCellMesh(n);
-  var M = mesh.instanceMatrix.array;      // written directly: setMatrixAt
-  var C = mesh.instanceColor.array;       // and setColorAt are per-call
-  var pal = args.palettes;                // overhead 18,000 times over
-  var mode = args.colourBy;
-  var hs = args.heightScale;
-  var gap = args.showGrid ? 0.88 : 1.0;
-  var zlo = c.zRange[0], zhi = Math.max(c.zRange[1], zlo + 0.001);
-  var sizes = c.sizes;
-  var pSem = pal.semantic, pTrav = pal.traversability, pLvl = pal.level;
-  var tmp = new THREE.Color();
-
+  // Split once so each mesh knows how many instances it needs.
+  var nBox = 0;
   for (var i = 0; i < n; i++) {
-    var size = sizes[lvl[i]] * gap;
-    var base = zcm[2 * i] * 0.01, top = zcm[2 * i + 1] * 0.01;
-    // A flat cell still gets a sliver of thickness so it catches the light
-    // and reads as a surface rather than as a z-fighting plane.
-    var h = (top - base) * hs;
-    if (h < 0.02) h = 0.02;
+    if ((zcm[2 * i + 1] - zcm[2 * i]) * 0.01 * hs > FLAT_MAX_H) nBox++;
+  }
+  ensureCellMeshes(n - nBox, nBox);
+  if (!S.flatIdx || S.flatIdx.length < S.flatCapacity) {
+    S.flatIdx = new Int32Array(S.flatCapacity);
+  }
+  if (!S.boxIdx || S.boxIdx.length < S.boxCapacity) {
+    S.boxIdx = new Int32Array(S.boxCapacity);
+  }
 
-    // An axis-aligned scale + translation, written straight into the
-    // buffer. compose() through a Quaternion and three Vector3s costs
+  var FM = S.flatMesh.instanceMatrix.array, FC = S.flatMesh.instanceColor.array;
+  var BM = S.boxMesh.instanceMatrix.array, BC = S.boxMesh.instanceColor.array;
+  var pal = S.run.palettes, mode = view.colourBy;
+  var pSem = pal.semantic, pTrav = pal.traversability, pLvl = pal.level;
+  var zlo = c.zRange[0], zhi = Math.max(c.zRange[1], zlo + 0.001);
+  var cls = c.cls, trav = c.trav, ret = c.ret, span = c.span;
+  var tmp = new THREE.Color();
+  var fi = 0, bi = 0;
+  var minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  var minY = Infinity, maxY = -Infinity;
+
+  for (var j = 0; j < n; j++) {
+    // Drawn footprint: the cell's own resolution, or the bucket it
+    // stands for where the display thinned its neighbours away.
+    var size = span[j] * 0.01 * gap;
+    var base = zcm[2 * j] * 0.01;
+    var h = (zcm[2 * j + 1] * 0.01 - base) * hs;
+    var flat = h <= FLAT_MAX_H;
+    var x = c.ox + xy[2 * j] * 0.01;
+    var z = -(c.oy + xy[2 * j + 1] * 0.01);
+    var y = flat ? base + 0.01 : base + h / 2;
+
+    // An axis-aligned scale and translation, written straight into the
+    // buffer: compose() through a Quaternion and three Vector3s costs
     // more than the rest of the loop at this instance count.
-    var o = i * 16;
-    M[o] = size;      M[o + 1] = 0;  M[o + 2] = 0;     M[o + 3] = 0;
-    M[o + 4] = 0;     M[o + 5] = h;  M[o + 6] = 0;     M[o + 7] = 0;
-    M[o + 8] = 0;     M[o + 9] = 0;  M[o + 10] = size; M[o + 11] = 0;
-    M[o + 12] = xy[2 * i];                    // world x  -> three x
-    M[o + 13] = base + h / 2;                 // world z  -> three y
-    M[o + 14] = -xy[2 * i + 1];               // world y  -> three -z
+    var M = flat ? FM : BM;
+    var o = (flat ? fi : bi) * 16;
+    M[o] = size;  M[o + 1] = 0; M[o + 2] = 0;    M[o + 3] = 0;
+    M[o + 4] = 0; M[o + 5] = flat ? 1 : h;       M[o + 6] = 0;
+    M[o + 7] = 0; M[o + 8] = 0; M[o + 9] = 0;    M[o + 10] = size;
+    M[o + 11] = 0; M[o + 12] = x; M[o + 13] = y; M[o + 14] = z;
     M[o + 15] = 1;
 
     var rgb;
-    if (mode === "traversability") rgb = pTrav[trav[i]];
-    else if (mode === "resolution level") rgb = pLvl[lvl[i]];
+    if (mode === "traversability") rgb = pTrav[trav[j]];
+    else if (mode === "resolution level") rgb = pLvl[lvl[j]];
     else if (mode === "height") {
-      var t = (top - zlo) / (zhi - zlo);
+      var t = (zcm[2 * j + 1] * 0.01 - zlo) / (zhi - zlo);
       if (t < 0) t = 0; else if (t > 1) t = 1;
       tmp.setHSL(0.62 - 0.62 * t, 0.62, 0.30 + 0.28 * t);
       rgb = [tmp.r, tmp.g, tmp.b];
-    } else rgb = pSem[cls[i]];
+    } else rgb = pSem[cls[j]];
 
     // A cell backed by one return is dimmer than one backed by forty: the
     // same "observed vs barely observed" distinction the inspector spells
     // out, without a separate layer.
-    var k = ret[i] / 12;
+    var k = ret[j] / 12;
     var conf = 0.62 + 0.38 * (k > 1 ? 1 : k);
-    var p = i * 3;
-    C[p] = rgb[0] * conf;
-    C[p + 1] = rgb[1] * conf;
-    C[p + 2] = rgb[2] * conf;
+    var C = flat ? FC : BC;
+    var p = (flat ? fi : bi) * 3;
+    C[p] = rgb[0] * conf; C[p + 1] = rgb[1] * conf; C[p + 2] = rgb[2] * conf;
+
+    // Instance order is not cell order once the two meshes split them,
+    // so a raycast hit needs the way back.
+    if (flat) { S.flatIdx[fi] = j; fi++; } else { S.boxIdx[bi] = j; bi++; }
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    if (y < minY) minY = y; if (y + h > maxY) maxY = y + h;
   }
 
-  mesh.count = n;
-  mesh.instanceMatrix.needsUpdate = true;
-  mesh.instanceColor.needsUpdate = true;
+  S.flatMesh.count = fi;
+  S.boxMesh.count = bi;
+  S.flatMesh.instanceMatrix.needsUpdate = true;
+  S.flatMesh.instanceColor.needsUpdate = true;
+  S.boxMesh.instanceMatrix.needsUpdate = true;
+  S.boxMesh.instanceColor.needsUpdate = true;
+
+  // One sphere around everything drawn, so culling is correct rather than
+  // merely disabled.
+  var cxm = (minX + maxX) / 2, cym = (minY + maxY) / 2;
+  var czm = (minZ + maxZ) / 2;
+  var rad = 0.5 * Math.sqrt((maxX - minX) * (maxX - minX) +
+                            (maxY - minY) * (maxY - minY) +
+                            (maxZ - minZ) * (maxZ - minZ)) + 1;
+  [S.flatMesh, S.boxMesh].forEach(function (m) {
+    m.boundingSphere.center.set(cxm, cym, czm);
+    m.boundingSphere.radius = rad;
+  });
+
+  // Kept for the click path: world xy of every drawn cell, in order.
+  S.cellXY = c;
 }
 
 
@@ -784,27 +884,70 @@ function refreshLabels(args) {
 // ─────────────────────────────────────────────────────────────
 function animate() {
   requestAnimationFrame(animate);
-  if (!S.needsRender || !S.lastArgs) return;
+  if (!S.needsRender || !S.view) return;
   S.needsRender = false;
-  placeCamera(S.lastArgs);
+  placeCamera(S.view);
   S.renderer.render(S.scene, S.camera);
-  refreshLabels(S.lastArgs);
+  refreshLabels(S.view);
 }
 
 // ─────────────────────────────────────────────────────────────
 // Streamlit
 // ─────────────────────────────────────────────────────────────
+/** Draw one composed view. Everything below reads from the cached run. */
+function drawView(view) {
+  var t0 = performance.now();
+  buildCells(view);
+  buildObjects(view);
+  buildEgo(view);
+  buildRings(view);
+  buildPoints(view);
+  buildMarker(view);
+
+  var buildMs = performance.now() - t0;
+  S.buildMs = S.buildMs ? S.buildMs * 0.7 + buildMs * 0.3 : buildMs;
+  S.view = view;
+  S.needsRender = true;
+}
+
+/** Frame data plus the display options, in one object the builders read. */
+function composeView(frame, state, args) {
+  var view = {
+    cells: frame.cells, objects: frame.objects, ego: frame.ego,
+    points: frame.points, frame: frame.frame,
+    rings: S.run.rings, palettes: S.run.palettes,
+    colourBy: state.colourBy, heightScale: state.heightScale,
+    selected: state.selected || {},
+    showGrid: args.showGrid, showObjects: args.showObjects,
+    showLabels: args.showLabels, showRings: args.showRings,
+    showVelocity: args.showVelocity,
+  };
+  return view;
+}
+
 function onRender(event) {
   var args = event.detail.args;
-  var data = args.data;
-  if (!data) return;
-  Object.keys(args).forEach(function (k) {
-    if (k !== "data") data[k] = args[k];
-  });
 
-  var width = HOST.clientWidth || args.width || 900;
+  // The run arrives once, when it changed. On every other rerun it is
+  // null and we draw from the copy already here — that is the whole
+  // point of the split, and it is why playback no longer ships the map.
+  if (args.run) S.run = args.run;
+  if (!S.run) {
+    // A page reload drops this copy while the Streamlit session still
+    // believes it was sent. Ask for it rather than sitting blank.
+    EMPTY.textContent = "loading scene…";
+    EMPTY.style.display = "flex";
+    Streamlit.setComponentValue({ kind: "need_run", t: Date.now() });
+    return;
+  }
+
+  var state = args.state || {};
+  var idx = Math.max(0, Math.min(state.frame | 0, S.run.nFrames - 1));
+  var frame = S.run.frames[idx];
+  if (!frame) return;
+
+  var width = HOST.clientWidth || 900;
   var height = args.height || 520;
-
   if (!S.renderer) { S.width = width; S.height = height; init(width, height); }
   if (width !== S.width || height !== S.height) {
     S.width = width; S.height = height;
@@ -814,35 +957,20 @@ function onRender(event) {
   }
 
   // The orbit target follows the vehicle so the camera stays useful as the
-  // run plays, but the world itself is never transformed: every position in
-  // the payload is world-anchored and is drawn exactly where Python put it.
-  S.orbit.target = [args.data.ego.xy[0], args.data.ego.xy[1], 0];
+  // run plays, but the world itself is never transformed: every position
+  // is world-anchored and drawn exactly where Python put it.
+  S.orbit.target = [frame.ego.xy[0], frame.ego.xy[1], 0];
 
-  EMPTY.style.display = data.cells && data.cells.n ? "none" : "flex";
-
-  var t0 = performance.now();
-  buildCells(data);
-  buildObjects(data);
-  buildEgo(data);
-  buildRings(data);
-  buildPoints(data);
-  buildMarker(data);
-
-  // Browser-side cost of this update, shown in the HUD. The server half
-  // is in the FOVEA_PROFILE log; between them there is no guessing about
-  // where a slow replay is going.
-  var buildMs = performance.now() - t0;
-  S.buildMs = S.buildMs ? S.buildMs * 0.7 + buildMs * 0.3 : buildMs;
+  EMPTY.style.display = frame.cells && frame.cells.n ? "none" : "flex";
+  drawView(composeView(frame, state, args));
 
   HUD.innerHTML =
-    "frame " + (data.frame.index + 1) + " / " + data.frame.count +
-    "<br>" + data.cells.n.toLocaleString() + " cells · " +
-    data.objects.length + " objects" +
+    "frame " + (idx + 1) + " / " + (state.nFrames || S.run.nFrames) +
+    "<br>" + frame.cells.n.toLocaleString() + " cells · " +
+    frame.objects.length + " objects" +
     "<br>" + S.buildMs.toFixed(0) + " ms to build in the browser" +
     "<br>drag orbit · shift-drag pan · wheel zoom · click to inspect";
 
-  S.lastArgs = data;
-  S.needsRender = true;
   // setFrameHeight is NOT called here. The height only changes when the
   // column does, and announcing it on every frame makes Streamlit
   // re-render the component host — roughly doubling the reruns during

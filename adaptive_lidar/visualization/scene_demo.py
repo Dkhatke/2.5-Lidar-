@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
+import streamlit as st
+
 from adaptive_lidar.visualization import inspector as INS
 from adaptive_lidar.visualization import scene_component as SC
 from adaptive_lidar.visualization import scene_data as SD
@@ -51,14 +53,36 @@ CANVAS_H = 620
 REDRAW_FLOOR_S = {"Light": 0.12, "Balanced": 0.18, "Full": 0.30}
 _CLICK_KEY = "_scene_last_click"
 
-#: Draw-budget presets. The count is the cap on cells sent to the browser;
-#: the radius is how far out they are taken from. Both are reported under
-#: the canvas whenever they bite.
+#: What the browser was last sent. While this matches, the run payload is
+#: not re-sent and the component redraws from its own copy.
+_RUN_SENT = "_scene_run_sent"
+
+#: Draw-budget presets: (cells drawn at most, radius they are taken from).
+#:
+#: These are DISPLAY budgets. The map still holds every cell it computed
+#: and the inspector still reads them; `scene_data.display_sample` decides
+#: which are worth a draw call, foveated so detail stays near the vehicle.
+#: The thinning normally lands under the cap on its own — the cap is the
+#: guarantee, not the mechanism.
 DETAIL = {
-    "Light": (8000, 40.0),
-    "Balanced": (SD.DEFAULT_MAX_CELLS, SD.DEFAULT_RADIUS_M),
-    "Full": (45000, 75.0),
+    "Light": (2500, 45.0),
+    "Balanced": (5000, SD.DEFAULT_RADIUS_M),
+    "Full": (9000, 75.0),
 }
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _run_payload(_run, key, max_cells: int, radius: float,
+                 show_points: bool):
+    """Every frame's drawable geometry, built once per run.
+
+    `cache_resource`, not `cache_data`: this is a megabyte or two and
+    `cache_data` would deep-copy it on every hit, which is most of what
+    the caching is there to avoid. `_run` is hash-excluded by the leading
+    underscore; `key` carries the identity.
+    """
+    return SD.build_run_payload(_run, budget=max_cells, radius_m=radius,
+                                show_points=show_points)
 
 
 def _state(defaults: Dict[str, Any]) -> None:
@@ -315,9 +339,13 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
     if SESSION.owns_ticker("scene"):
         pb.tick_if_playing()
     idx = min(pb.state.frame_idx, n - 1)
-    def _report() -> None:
+    def _report(paced: bool = True) -> None:
         took = _t.perf_counter() - _t0
-        SESSION.record_redraw("scene", took)
+        # A redraw that also BUILT and sent the run is a load, not a
+        # playback frame. Folding seconds of one-off work into the pace
+        # stretched the playback interval to several seconds.
+        if paced:
+            SESSION.record_redraw("scene", took)
         PROFILE.log("scene", f"{took * 1000:7.1f} ms  frame {idx}  "
                              f"pace {SESSION.redraw_cost('scene'):.3f}")
     snap = run.frames[idx]
@@ -328,12 +356,30 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
         SESSION.set_selection(sel)
 
     max_cells, radius = DETAIL[opt["detail"]]
-    data = SD.build_scene_data(
-        snap, frame_idx=idx, n_frames=n,
-        colour_by=opt["colour_by"], height_mode=opt["height_mode"],
-        max_cells=max_cells, radius_m=radius,
-        show_points=st.session_state["scene_points"],
-        selected=SD.selection_marker(sel))
+
+    # The run's geometry is built once and cached in the browser. The
+    # identity is everything that changes what was built; the display
+    # options are deliberately NOT in it, so changing colour or height
+    # costs nothing.
+    run_id = (opt["scenario"], opt["n_frames"],
+              bool(st.session_state[SESSION.GATE_KEY]), opt["detail"],
+              bool(st.session_state["scene_points"]))
+    # Built (or fetched from cache) every run; SENT only when it changed.
+    payload = _run_payload(run, run_id, max_cells, radius,
+                           bool(st.session_state["scene_points"]))
+    run_payload = None
+    if st.session_state.get(_RUN_SENT) != run_id:
+        run_payload = payload
+        st.session_state[_RUN_SENT] = run_id
+
+    state = {
+        "frame": int(idx),
+        "nFrames": int(n),
+        "colourBy": opt["colour_by"],
+        "heightScale": SD.HEIGHT_MODES.get(opt["height_mode"], 0.45),
+        "heightMode": opt["height_mode"],
+        "selected": SD.selection_marker(sel),
+    }
 
     with centre:
         UI.disclaimer(
@@ -342,24 +388,34 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
             "produced — this is a stylised view of the 2.5D map, not a 3D "
             "reconstruction, and no second perception run stands behind it.")
         raw = SC.render(
-            data, key="fovea_scene", height=CANVAS_H,
+            run=run_payload, state=state, key="fovea_scene", height=CANVAS_H,
             show_grid=st.session_state["scene_grid"],
             show_objects=st.session_state["scene_objects"],
             show_labels=st.session_state["scene_labels"],
             show_rings=st.session_state["scene_rings"],
             show_velocity=st.session_state["scene_velocity"])
 
+        if SC.needs_run(raw):
+            # A page reload drops the browser's copy while this session
+            # still believes it was sent. Forget, and send it again.
+            st.session_state.pop(_RUN_SENT, None)
+            SESSION.refresh("app")
+
         click = SC.consume_click(raw, _CLICK_KEY)
         if click is not None:
             _apply_click(click, snap, idx)
 
         _legend(opt["colour_by"])
-        UI.metrics_strip(list(SD.scene_summary(data).items()))
+        UI.metrics_strip(list(SD.scene_summary(
+            payload["frames"][min(idx, len(payload["frames"]) - 1)]).items()))
         st.caption(
-            f"Heights are drawn at {data['heightScale']:.0%} of the stored "
-            f"base-to-top extent ({opt['height_mode']}). Cell footprints "
-            f"are 1:1 with their real resolution. Camera is client-side: "
-            f"moving it costs nothing and changes no stored coordinate.")
+            f"Heights are drawn at {state['heightScale']:.0%} of the stored "
+            f"base-to-top extent ({opt['height_mode']}). The map keeps "
+            f"every cell; the scene draws a foveated sample of them, and "
+            f"a drawn tile covers the area it stands for — so colour by "
+            f"**resolution level** to read what the map actually chose. "
+            f"The run's geometry is sent once and a frame change sends "
+            f"only its index.")
 
     with right:
         with st.container(height=RAIL_H, border=False):
@@ -371,7 +427,7 @@ def _workspace(precompute_fn: Callable[..., Any]) -> None:
     sp1, _sp2 = st.columns([1, 5])
     with sp1:
         pb.speed_selector()
-    _report()
+    _report(paced=run_payload is None)
 
 
 def _apply_click(click: Dict[str, Any], snap, idx: int) -> None:

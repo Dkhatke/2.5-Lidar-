@@ -1488,3 +1488,69 @@ frames          0 1 2 3 ... 23 0 1   strictly in order, context alive
 ```
 
 Tests: 239 → **248**.
+
+### Follow-up: Scene Demo performance
+
+Visualisation-only. No pipeline, map, perception or metric was touched —
+the map still holds every cell it computed and the inspector still reads
+all of them.
+
+**Too many cells.** The scene asked the browser to draw every cell within
+55 m: ~18,000, and up to 150,000 in radius on a late frame.
+`scene_data.display_sample` now picks a foveated, deterministic sample —
+buckets double in size every 12 m of range, one survivor each, drawn at
+the span it stands for so a road still reads as a surface. Vehicles, VRUs
+and cells the map calls moving are never thinned. Safety-pinned cells are
+NOT exempt, because the pin is a tile-level constraint that covers 22% of
+a frame; they get the finer bucket instead.
+
+```
+cells drawn, 24-frame mixed_urban:  ~18,000  ->  2,829-4,930 (median 4,929)
+```
+
+**Expensive geometry.** 93% of drawn cells are flat — base and top within
+a few centimetres — and were being drawn as twelve-triangle boxes. They
+now go into an instanced quad; only cells with real vertical extent get a
+box.
+
+**The map was re-serialised every displayed frame.** Streamlit re-sends an
+element's args on every rerun, so the payload went down the wire per
+frame. Now `build_run_payload` builds every frame's geometry once, the
+component receives it when the run changes — scenario, frame count, MOS
+setting, draw budget, point overlay — and `None` on every other rerun,
+drawing from the copy it holds. Playback sends the frame index and the
+selection, a few hundred bytes. If a page reload drops the browser's
+copy it asks for it back rather than sitting blank.
+
+```
+per displayed frame:  ~393 kB re-sent  ->  0 bytes of geometry
+per run (once):                        ->  2.12 MB
+```
+
+**Per-frame object recreation.** The instanced mesh was disposed and
+rebuilt every frame; it is allocated once at a growing capacity and the
+buffers are overwritten. Object geometry is cached by shape and size, the
+point cloud reuses one buffer, ego and rings are rebuilt from cached
+geometry.
+
+**Culling.** The instanced meshes had `frustumCulled = false` because
+three cannot derive a bounding sphere from instance matrices. One is now
+computed from the drawn extent each frame and culling is enabled. With a
+single mesh spanning the scene the benefit is small — it helps only when
+the camera faces away — but it is correct rather than merely disabled.
+
+Measured, `FOVEA_PROFILE=1`, 24-frame `mixed_urban`, Balanced budget:
+
+```
+server redraw (steady state)   460 ms  ->   58 ms median over 21 redraws
+browser build                            10-67 ms
+payload re-sends over 18 s of playback    0  (12 state-only renders)
+run build, once per run                   4.3 s
+```
+
+The one-off build is a real new cost at load, on top of the pipeline
+precompute, and is the price of not paying it per frame.
+
+Tests: 248, all passing, including that the subset traversability verdict
+still equals the full one and that a centimetre-quantised centre off the
+wire still resolves to its own 5 cm cell.

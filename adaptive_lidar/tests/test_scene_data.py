@@ -83,27 +83,34 @@ def _unpack(d, key, dtype):
 # ════════════════════════════════════════════════════════════
 # Cell geometry
 # ════════════════════════════════════════════════════════════
-def test_cell_centres_survive_the_wire_exactly():
-    """The click path round-trips through these, into the real lookup.
+def test_a_centre_off_the_wire_still_finds_its_own_cell():
+    """Centres travel as centimetre offsets, and that has to be safe.
 
-    A quantised centre could resolve to the neighbouring 5 cm cell, which
-    is why the centres stay float32 while the heights do not.
+    The click path round-trips through them into the real cell lookup, so
+    the question is not whether the number is exact but whether it still
+    lands inside the cell it came from. Half a centimetre of quantisation
+    against the 2.5 cm from the centre of the SMALLEST cell to its own
+    boundary — with margin to spare, and this is what pins it.
     """
     # Deliberately NOT nested: a coarse cell containing a fine one is a
     # real case, but then the finest wins and this test would be asserting
     # the wrong thing. Each level gets its own patch of world.
-    pts = [_centre(401 + 200 * lvl, -97 - 200 * lvl, lvl) + (lvl,)
+    # Spread over ~40 m, the way a real frame is: the wire format encodes
+    # offsets from the set's own centre and is bounded by the draw radius.
+    pts = [_centre(int(12.0 * lvl / ResolutionLevel.size(lvl)),
+                   int(-9.0 * lvl / ResolutionLevel.size(lvl)), lvl) + (lvl,)
            for lvl in range(ResolutionLevel.N_LEVELS)]
     cells = _cells(pts)
     keep = np.arange(len(pts))
     g = SD.cell_geometry(cells, keep)
-    xy = _unpack(g, "xy", np.float32).reshape(-1, 2)
+    off = _unpack(g, "xy", np.int16).reshape(-1, 2).astype(np.float64) / 100.0
+    ox, oy = g["origin"]
     for i, (cx, cy, _lvl) in enumerate(pts):
-        assert xy[i, 0] == pytest.approx(cx, abs=1e-6)
-        assert xy[i, 1] == pytest.approx(cy, abs=1e-6)
-        # ...and the point still finds its own cell through the real lookup.
-        assert SEL.find_cell_row(cells, float(xy[i, 0]),
-                                 float(xy[i, 1])) == (i, i)
+        x, y = ox + off[i, 0], oy + off[i, 1]
+        assert x == pytest.approx(cx, abs=0.006)
+        assert y == pytest.approx(cy, abs=0.006)
+        # ...and it still resolves to its own cell, which is the point.
+        assert SEL.find_cell_row(cells, float(x), float(y)) == (i, i)
 
 
 @pytest.mark.parametrize("level", range(ResolutionLevel.N_LEVELS))
@@ -349,11 +356,13 @@ def test_points_are_only_the_real_dynamic_overlay():
 
 def test_the_summary_reports_what_was_dropped():
     entries = [_centre(i, 0, 2) + (2,) for i in range(400)]
-    snap = _Snap(_cells(entries))
+    # dynamic_prob 0: the fixture's 128/255 would read as "moving", and a
+    # moving cell is exempt from thinning by design.
+    snap = _Snap(_cells(entries, dynamic_prob=0))
     d = SD.build_scene_data(snap, frame_idx=0, n_frames=1, max_cells=50)
     s = SD.scene_summary(d)
-    assert s["cells drawn"] == "50"
-    assert "cells beyond the draw radius" in s
+    assert int(s["cells drawn"].replace(",", "")) <= 50
+    assert "thinned for display" in s
 
 
 def test_the_summary_reports_padded_boxes():
@@ -459,12 +468,18 @@ def test_the_verdict_is_skipped_unless_it_is_drawn():
     assert _unpack(off, "trav", np.uint8)[0] == 0        # not computed
 
 
-def test_the_scene_asks_for_the_verdict_only_in_that_colour_mode():
+def test_the_verdict_travels_with_every_payload():
+    """The run is built once and cached in the browser, so it must carry
+    everything a colour mode might need.
+
+    Skipping the verdict used to be worth it when the payload was rebuilt
+    per frame. Now it is computed for ~4,000 sampled cells once per run,
+    and carrying it is what lets the colour mode change without sending
+    the map again.
+    """
     snap = _Snap(_cells([_centre(5, 5, 1) + (1,)], sem_class=4, n_points=30,
                         overhead_clearance=9.0))
-    sem = SD.build_scene_data(snap, frame_idx=0, n_frames=1,
-                              colour_by="semantic")
-    trav = SD.build_scene_data(snap, frame_idx=0, n_frames=1,
-                               colour_by="traversability")
-    assert _unpack(trav["cells"], "trav", np.uint8)[0] ==         Traversability.BLOCKED
-    assert _unpack(sem["cells"], "trav", np.uint8)[0] == 0
+    for mode in ("semantic", "traversability"):
+        d = SD.build_scene_data(snap, frame_idx=0, n_frames=1,
+                                colour_by=mode)
+        assert _unpack(d["cells"], "trav", np.uint8)[0] ==             Traversability.BLOCKED

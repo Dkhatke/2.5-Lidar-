@@ -86,14 +86,16 @@ def record_redraw(tab: str, seconds: float) -> None:
     import streamlit as st
     key = f"_redraw_{tab}"
     prev = st.session_state.get(key)
-    # Rises fast, falls slowly: a machine that just struggled should back
-    # off immediately, and earn its speed back gradually.
+    # Rises fast, recovers steadily. The recovery used to be much slower,
+    # which trapped the pace: one expensive redraw stretched the interval,
+    # a long interval means few samples, and few samples meant it took
+    # minutes to come back down.
     if prev is None:
         new = float(seconds)
     elif seconds > prev:
         new = 0.4 * prev + 0.6 * float(seconds)
     else:
-        new = 0.85 * prev + 0.15 * float(seconds)
+        new = 0.6 * prev + 0.4 * float(seconds)
     st.session_state[key] = min(max(new, 0.02), 3.0)
 
 

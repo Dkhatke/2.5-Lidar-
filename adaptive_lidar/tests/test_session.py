@@ -164,20 +164,26 @@ def test_the_floor_applies_before_any_measurement(state):
     assert SESSION.paced_interval("scene", 0.01, floor=0.18) >= 0.18
 
 
-def test_it_backs_off_fast_and_recovers_slowly(state):
+def test_it_backs_off_fast_and_recovers_steadily(state):
     """A machine that just struggled should slow down at once.
 
-    Earning the speed back gradually avoids oscillating between a rate
-    that works and one that does not.
+    Recovery is slower than the back-off so it does not oscillate, but it
+    must not be so slow that one expensive redraw traps the pace: a long
+    interval means few samples, and few samples used to mean minutes
+    before it came back down.
     """
     for _ in range(10):
         SESSION.record_redraw("scene", 0.10)
     quick = SESSION.redraw_cost("scene")
     SESSION.record_redraw("scene", 1.00)            # one bad redraw
-    assert SESSION.redraw_cost("scene") > quick * 3
-    slow = SESSION.redraw_cost("scene")
-    SESSION.record_redraw("scene", 0.10)            # one good one
-    assert SESSION.redraw_cost("scene") > slow * 0.7
+    spiked = SESSION.redraw_cost("scene")
+    assert spiked > quick * 3                       # backs off at once
+
+    one = SESSION.record_redraw("scene", 0.10) or SESSION.redraw_cost("scene")
+    assert one < spiked                             # ...and starts back
+    for _ in range(6):
+        SESSION.record_redraw("scene", 0.10)
+    assert SESSION.redraw_cost("scene") < 0.15      # recovers in a few
 
 
 def test_the_pace_is_clamped_to_something_sane(state):
