@@ -1,161 +1,173 @@
-# Dependency Guide — SIH26 Adaptive LiDAR
+# Dependency Guide
 
-> **Who is this for?**  
-> Every team member who installs or modifies the project.  
-> Read this before adding or removing a dependency.
+Adaptive Variable-Resolution 2.5D LiDAR Mapping — SIH 2026 / DRDO PS 26053.
+
+> **Who is this for?** Anyone installing the project or changing what it
+> depends on. [`requirements.txt`](../requirements.txt) is the source of
+> truth; this file explains the *why* behind each line and records what was
+> actually tested.
 
 ---
 
-## Quick-start
+## Quick start
 
 ```bash
-# 1 — create isolated environment (do this ONCE)
-python3 -m venv .venv
+# from the repository root — do this once
+python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r adaptive_lidar/requirements.txt
 
-# 2 — install everything
-pip install -r requirements.txt
-
-# 3 — run the demo
-streamlit run app.py
+cd adaptive_lidar
+python main.py --demo              # the pipeline, end to end
+streamlit run app.py               # the dashboard
+python -m pytest tests/ -q         # 248 tests
 ```
 
----
-
-## Core Dependencies (always required)
-
-| Package | Version | Why we need it |
-|---------|---------|----------------|
-| **numpy** | ≥1.24 | Foundation for all point-cloud arrays, masks, geometry math |
-| **scipy** | ≥1.10 | KD-tree spatial queries, connected-component labelling (S5), signal utilities |
-| **pandas** | ≥2.0 | Telemetry tables, per-frame timing stats, optional CSV export |
-| **torch** | ≥2.0 | Powers the `PrototypeSparseBackend` in S4; CPU-only mode works fine |
-| **scikit-learn** | ≥1.2 | DBSCAN / nearest-neighbour for instance matching in S5 |
-| **streamlit** | ≥1.28 | The full visual dashboard (`app.py`) |
-| **plotly** | ≥5.14 | All interactive charts (tile heatmaps, map views, telemetry plots) |
-| **pyyaml** | ≥6.0 | Reads `config.yaml` — no constants are hard-coded in Python files |
-| **pytest** | ≥7.0 | Unit tests in the `tests/` directory |
+Nothing is downloaded at run time and nothing needs a GPU. The synthetic
+sensor model and the trained weights (`models/pointfeature_net.pt`) are both
+committed, so a fresh clone runs.
 
 ---
 
-## Optional Dependencies
+## Core dependencies (all required)
 
-### open3d (3-D point-cloud viewer)
+| Package | Pin | Why we need it |
+|---|---|---|
+| **numpy** | ≥1.24,<3.0 | every array path in the pipeline |
+| **scipy** | ≥1.10 | `ndimage.label` for connected components (S5), `optimize.linear_sum_assignment` for track association |
+| **pandas** | ≥2.0 | dashboard tables, per-frame timing, CSV export |
+| **torch** | ≥2.0, CPU wheel | `PointFeatureNet` — 11,406 parameters, CPU inference |
+| **streamlit** | ≥1.33 | the dashboard. 1.33 is the floor for `st.fragment`, which is how playback advances a frame without blocking the server thread; below it the Live demo degrades to manual stepping rather than failing |
+| **streamlit-image-coordinates** | ≥0.1.9 | click-to-select on the map canvas |
+| **matplotlib** | ≥3.7 | the figures in `docs/*.png` |
+| **pillow** | ≥10.0 | image I/O for the rendered map |
+| **pyyaml** | ≥6.0 | reads `config.yaml` |
+| **pytest** | ≥7.0 | the 248 tests in `tests/` |
+
+If pip resolves `torch` to a CUDA build, ask for the CPU one explicitly:
 
 ```bash
-pip install open3d
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-- Adds a standalone 3-D viewer tab to the dashboard  
-- **Not required** — the Plotly-based views work without it  
-- May be slow to install on some platforms; skip if time is limited
-
-### MinkowskiEngine (real sparse convolution)
-
-```bash
-# Only attempt if CUDA + matching PyTorch are confirmed
-pip install MinkowskiEngine
-```
-
-- Powers the `MinkowskiBackend` in S4 — the *intended* production backend  
-- **NOT required for the prototype** — the system falls back automatically  
-- See [`INSTALL_MINKOWSKI.md`](INSTALL_MINKOWSKI.md) for the full installation guide  
-- **Time limit rule**: spend at most 60 min on this; if it fails, move on
+**The 3D Scene demo adds no Python dependency.** three.js r128 (MIT) is
+vendored at `visualization/scene_frontend/vendor/three.min.js` and served as a
+static Streamlit component: no node, no build step, nothing fetched at run
+time.
 
 ---
 
-## Backend Fallback Chain (S4 Semantic Perception)
+## Optional dependencies
 
-The system **never crashes** because of a missing optional dependency.  
-The active backend is shown clearly in the dashboard sidebar.
+### `pypatchworkpp` — ground segmentation
 
-```
-SparseSemanticBackend
-│
-├─ 1. MinkowskiBackend          ← real sparse convolution (optional)
-│       requires: MinkowskiEngine + compatible CUDA
-│
-├─ 2. PrototypeSparseBackend   ← lightweight PyTorch sparse coords
-│       requires: torch only
-│
-└─ 3. GeometryFallbackBackend  ← pure numpy rule-based
-        requires: numpy only (always available)
-```
+`perception/ground.py` tries `import pypatchworkpp` exactly once and caches the
+result. If it is absent — the normal case — ground extraction uses the
+ring-geometry fallback, which is what every number in
+[`RESULTS.md`](RESULTS.md) was measured with. The import can never raise: it
+is wrapped in a bare `try/except` and the result is cached, so a missing
+package costs one failed import for the life of the process.
+
+That is the complete list. There is no `open3d`, `plotly` or `scikit-learn`
+dependency anywhere in the codebase — if you find an import of one, it is a
+bug.
 
 ---
 
-## Dataset: SemanticKITTI (PRIMARY) + Synthetic (FALLBACK)
+## Deliberately absent
 
-### SemanticKITTI
-
-```
-dataset/
-└── sequences/
-    ├── 00/
-    │   ├── velodyne/   ← raw .bin scans  (x y z intensity, float32)
-    │   ├── labels/     ← .label files    (uint32 per point)
-    │   └── poses.txt   ← ego-vehicle poses
-    └── ...
-```
-
-- Download from: <https://semantic-kitti.org/dataset.html>  
-- **Recommended for prototype**: sequence `00`, first 100–300 frames  
-- Labels are used **only for evaluation** — not fed into the allocation logic  
-- Class remapping (SemanticKITTI → our 6 classes) defined in `config.yaml`
-
-### Synthetic fallback
-
-- Activated automatically when no SemanticKITTI path is provided  
-- Generated by `data/synthetic_scene.py`  
-- Contains: ground, road, curbs, parked vehicles, 1 moving vehicle,  
-  pedestrians, vegetation, wall, distant points  
-- Multiple consecutive frames with visible object motion  
+`MinkowskiEngine`, `torchsparse`, `spconv` and Open3D-ML's CUDA ops are not
+here and are not optional extras. They require CUDA to **build**, not merely
+to run, so on a CPU-only machine they can never be anything but an
+`ImportError` path — dead code implying a capability the system does not have.
+The backend wrappers for them were deleted in Phase 9; see `DECISIONS.md` 9.1
+and the Phase 9 entry in `PROGRESS.md`.
 
 ---
 
-## Python Version
+## Semantic backends (S4)
 
-| | Minimum | Recommended |
-|-|---------|-------------|
-| Python | 3.8 | **3.10 or 3.11** |
+Three implementations behind one interface, all pure CPU. The active one is
+named in the dashboard header and recorded in the `backend` column of every
+metrics row.
 
-> Python 3.9 (system default on macOS 12+) works but 3.10/3.11 is preferred  
-> for better type-hint support and `match` statements.
+| Name | Requires | What it is |
+|---|---|---|
+| `pointfeature_net` | torch + the committed checkpoint | the trained MLP (M1) — the default |
+| `geometry_rules` | numpy only | vectorised per-point rules; no training, always available. The honest floor the network must beat |
+| `oracle` | ground-truth labels | returns the true class directly. **Evaluation only** — it measures the map, never the segmenter, and is unreachable from `auto` |
+
+`auto` prefers the trained network and falls back to `geometry_rules` with a
+logged reason (a missing checkpoint on a fresh clone, typically). Selecting
+`oracle` warns on the console and shows a banner in the dashboard.
+
+---
+
+## Data
+
+### Synthetic (the default, and what everything reported was measured on)
+
+Generated by `data/synthetic_scene.py` — a genuine raycast simulation with
+real occlusion, 1/r³ ground falloff, multi-echo returns and material
+reflectance. Six scenarios: `empty_road`, `pedestrian_far`,
+`canopy_over_road`, `moving_vehicle`, `convoy`, `mixed_urban`. No download, no
+configuration; `get_dataset("auto", root=None)` selects it.
+
+### SemanticKITTI / RELLIS-3D (supported, untested against a real sequence)
+
+`data/loader.py` reads both trees and `data/label_maps.py` holds the
+collision-proof remapping to the project's 6 classes (`SEMANTICKITTI_TO_6`,
+`RELLIS_TO_6`); `tests/test_pipeline.py` covers the table builder and the
+remapping. Point the loader at a root:
+
+```
+<root>/sequences/00/velodyne/*.bin     raw scans (x y z intensity, float32)
+<root>/sequences/00/labels/*.label     uint32 per point
+<root>/sequences/00/poses.txt          ego poses
+```
+
+Download from <https://semantic-kitti.org/dataset.html>. An unusable root
+falls back to synthetic with a printed reason rather than crashing.
+
+**No real sequence was available on the development machine, so that path has
+never been run against one.** Labels are read only by `evaluation/` and the
+`oracle` backend; `tests/test_gt_label_isolation.py` fails if any perception
+or mapping module touches them. Datasets are gitignored and none is
+redistributed here.
+
+---
+
+## Python version
+
+| | |
+|---|---|
+| **Verified on** | 3.13.1 (Windows, CPU only) — every number in `docs/` was measured on it |
+| **Expected to work** | 3.11 – 3.13 |
+| **Nominal minimum** | 3.9 — the code uses no `match` statements and guards its PEP 604 annotations with `from __future__ import annotations`, but no run below 3.13 has been tested |
 
 ---
 
 ## GPU / CUDA
 
-| Mode | What works |
-|------|-----------|
-| No GPU (CPU only) | Full pipeline, Prototype + Geometry backends |
-| GPU + CUDA | Above + MinkowskiBackend if installed |
-
-Check your setup:
-
-```python
-import torch
-print(torch.cuda.is_available())   # True = GPU available
-print(torch.version.cuda)          # e.g. "12.1"
-```
+None, at any point. There is no CUDA code path to enable, so
+`torch.cuda.is_available()` is never consulted: the pipeline, the network, the
+map and the dashboard are CPU-only by design, and a GPU changes nothing about
+the reported numbers.
 
 ---
 
-## Adding a New Dependency
+## Adding a dependency
 
-1. Add it to `requirements.txt` with a comment explaining **why**  
-2. Update this file with the new row in the table  
-3. If optional: wrap the import in a `try/except` and degrade gracefully  
-4. Run `pip install -r requirements.txt` and confirm tests still pass  
+1. Add it to `requirements.txt` with a comment explaining **why**.
+2. Add a row to the table above.
+3. If it is optional, wrap the import and degrade gracefully — `ground.py` is
+   the pattern to copy.
+4. Reinstall and confirm `python -m pytest tests/ -q` still passes.
 
----
+## Removing a dependency
 
-## Removing a Dependency
-
-Before removing anything, search for its import across the codebase:
+Search before deleting, and check the stages as well as the tests:
 
 ```bash
-grep -r "import <package>" adaptive_lidar/
+grep -rn "import <package>" adaptive_lidar/
 ```
-
-Make sure no stage silently depends on it before deleting.

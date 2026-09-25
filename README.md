@@ -1,32 +1,81 @@
 # Adaptive Variable-Resolution 2.5D LiDAR Mapping
 
-**SIH 2026 · DRDO problem statement 26053 — Adaptive Variable Resolution 2.5D
-LiDAR Mapping for Dynamic Environment Perception**
+**Smart India Hackathon 2026 · DRDO · Problem Statement 26053 — Adaptive
+Variable Resolution 2.5D LiDAR Mapping for Dynamic Environment Perception**
+
+![Python 3.11-3.13](https://img.shields.io/badge/python-3.11%E2%80%933.13-blue)
+![CPU only](https://img.shields.io/badge/hardware-CPU%20only-success)
+![tests 248 passing](https://img.shields.io/badge/tests-248%20passing-brightgreen)
+![License MIT](https://img.shields.io/badge/license-MIT-blue)
 
 A 2.5D map whose cells are genuinely different physical sizes — 5 cm where it
 matters, 80 cm where it does not — with the size chosen by a budgeted
 controller that treats safety as a constraint rather than a weighted term.
 CPU only; no CUDA anywhere.
 
+![The fine region travels with the vehicle](adaptive_lidar/docs/screenshots/foveation_follows_vehicle.png)
+
+*Three points in one run, same camera, coloured by cell size. The 5 cm region
+travels with the vehicle; the far field stays coarse. Nothing here is
+pre-baked — the allocation is recomputed every frame under a fixed memory
+budget.*
+
 ---
 
-## Run it in three commands
+## Submission
+
+| | |
+|---|---|
+| **Problem Statement ID** | 26053 |
+| **Problem Statement** | Adaptive Variable Resolution 2.5D LiDAR Mapping for Dynamic Environment Perception |
+| **Organisation** | DRDO, Ministry of Defence |
+| **Event** | Smart India Hackathon 2026 |
+| **Category** | Software |
+| **Repository** | <https://github.com/Dkhatke/2.5-Lidar-> |
+| **Demo video** | _TODO — paste the YouTube / Drive link here before submitting_ |
+| **Licence** | [MIT](LICENSE) |
+
+**Where to look, in order**
+
+1. [Quickstart](#quickstart) — a fresh clone runs as it stands: no data
+   download, no configuration, no GPU.
+2. [What it does](#what-it-does) — each requirement M1–M6 mapped to the file
+   that implements it.
+3. [`adaptive_lidar/docs/RESULTS.md`](adaptive_lidar/docs/RESULTS.md) — every
+   reported number, with the script and the CSV it came from.
+4. [`adaptive_lidar/docs/ARCHITECTURE.md`](adaptive_lidar/docs/ARCHITECTURE.md)
+   — stage-by-stage design and the full data contract.
+5. [`DECISIONS.md`](DECISIONS.md) and [`PROGRESS.md`](PROGRESS.md) — every
+   judgement call with its reason, and the working log with pasted
+   verification output.
+6. [Where it falls short](#where-it-falls-short) — the limits, stated by us
+   rather than found by you.
+
+---
+
+## Quickstart
 
 ```bash
+git clone https://github.com/Dkhatke/2.5-Lidar-.git
+cd 2.5-Lidar-
+
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r adaptive_lidar/requirements.txt
 
 cd adaptive_lidar
-python main.py --demo                 # the pipeline, end to end
-streamlit run app.py                  # FOVEA — opens on the Live demo tab
+python main.py --demo                # the pipeline, end to end
+streamlit run app.py                 # FOVEA — opens on the Live demo tab
 ```
 
 No data download, no configuration, no GPU. The synthetic sensor model and the
 trained network weights are both in the repository, so a fresh clone runs.
 
-To reproduce every reported number:
+To reproduce every reported number, and to run the test suite:
 
 ```bash
 python scripts/run_baselines.py && python scripts/generate_report.py
+python -m pytest tests/ -q           # 248 tests
 ```
 
 ---
@@ -54,6 +103,12 @@ whole answer to *"without causing alignment errors or data loss"* — it is
 structural, not a tolerance. The allocation tile (1.6 m = 0.05 × 2⁵) is a node
 of the same hierarchy, so one sort of the cloud groups it by tile and by cell
 at every level at once.
+
+![Cells coloured by resolution level](adaptive_lidar/docs/screenshots/layer_resolution_level.png)
+
+*The same map coloured by cell size rather than by class: 5 cm red at the
+sensor through to 80 cm teal at 100 m, every cell drawn at its true footprint
+so the varying size is visible rather than asserted.*
 
 **Allocation is a constrained optimisation.** Tiles are ranked by value per
 unit cost, `ρ = V / Δcells`, under a budget expressed as a fraction of a
@@ -90,10 +145,12 @@ python -m pytest tests/ -q                 # 248 tests
 
 Selected measured outcomes:
 
-* **The 70 m pedestrian survives every budget.** `full` keeps it at 11 cells
-  of 5 cm down to a 10% budget, using 1.12 MB; `random` at the same budget
-  keeps 2 cells at 80 cm using 1.71 MB; `distance_only` — exactly what the
-  problem statement literally asks for — spends 6.45 MB and keeps 2 cells.
+* **The 70 m pedestrian survives every budget.** On the `pedestrian_far`
+  scenario (`scripts/test_allocation.py`), `full` keeps it at 11 cells of 5 cm
+  from a 100% budget down to a 10% one, using 1.12 MB; `random` at the same
+  budget keeps 2 cells using 1.71 MB; `distance_only` — exactly what the
+  problem statement literally asks for — spends 6.45 MB and still keeps only
+  2 cells.
 * **The derived resolution law reproduces the PS's own example.** Cell size
   ∝ r, anchored 5 cm at 10 m, gives 50 cm at 100 m. It holds points-per-cell
   to 4.2× variation across range, where a uniform 20 cm grid varies 78× and a
@@ -112,14 +169,26 @@ Selected measured outcomes:
   in 99.98% of cells and the rest within the float16 quantum (~4 mm).
 * **The semantic network.** 11,406 parameters, validation mIoU 0.871, ECE
   0.0123 → 0.0080 after temperature scaling, 28.6 ms for 55k points on CPU.
-* **Speed-up over the previous implementation:** 4,247 → ~300 ms per frame at
-  120k points (24× at 8k, 22× at 30k, 13× at 120k).
+* **Speed-up over the previous implementation:** 4,246 → 370 ms per frame at
+  128k points — 24.0× at 8k, 19.0× at 32k, 11.5× at 128k
+  ([`RESULTS.md` §5](adaptive_lidar/docs/RESULTS.md)).
 
 ### The dashboard
 
 `streamlit run app.py` opens on **Live demo**: a scene you can drive, with a
 compact control rail on the left, a clickable map in the middle and a cell
 inspector on the right.
+
+![The FOVEA dashboard](adaptive_lidar/docs/screenshots/dashboard_main.jpg)
+
+*The dashboard on `mixed_urban`, `full` policy at a 50% budget: 103,289 cells
+in 3.62 MB against 6.30 MB for a uniform 5 cm map over the same frames, the
+cell-count histogram across the five physical sizes, and object retention per
+class. This is a 6-frame interactive run, so its figures differ from the
+canonical 8-frame report run in
+[`RESULTS.md`](adaptive_lidar/docs/RESULTS.md) (4.26 MB, 41.5% reduction, 370
+ms); both were measured on this machine. Captured before the tabbed layout
+landed, so the arrangement on screen now differs from this still.*
 
 * **Click any cell** and the inspector opens all 21 stored fields in eight
   sections — identity and Morton address, terrain and the traversability
@@ -128,11 +197,16 @@ inspector on the right.
   table. Clicking a tracked object opens the track instead, with a link down
   to the cell beneath it. The hit test resolves to the *finest* cell
   covering the point; `scripts/test_interaction.py` checks 1,196 clicks
-  across three cameras and gets the right cell every time.
+  across three camera/view-frame combinations and resolves every one of them
+  to the right cell (100.0% exact, run on a real precomputed scene).
 * **Playback** is an `st.fragment`, not a sleep loop: the controls stay live
   while it runs, and advancing a frame never re-enters the pipeline. The
   rate on screen is labelled a replay rate — it is bounded by drawing the
   canvas, not by perception.
+* Two more tabs hold the engineering work: **Research & evaluation** (the
+  equal-memory comparison, range-stratified accuracy, per-stage latency) and
+  **Debug & cell inspector** (query the live map by coordinate).
+
 **Scene demo** draws the same run as the physical environment the map is a
 map of: cells become surfaces at their real footprint, from `ground_z` to
 `z_max`; tracked instances become boxes, poles and figures; the stored pose
@@ -146,10 +220,6 @@ measured geometry it says so: a LiDAR sees one side of a car, so a box
 enlarged to be visible is shaded fainter and the inspector prints both the
 measured and the drawn extent.
 
-* Two more tabs hold the engineering work: **Research & evaluation** (the
-  equal-memory comparison, range-stratified accuracy, per-stage latency) and
-  **Debug & cell inspector** (query the live map by coordinate).
-
 Everything on screen states what it is: the header carries a *synthetic /
 demo data* badge and the actual configured backend, and every metric block
 repeats that these are demo-pipeline numbers, not deployment claims.
@@ -157,9 +227,11 @@ repeats that these are demo-pipeline numbers, not deployment claims.
 ### Where it falls short
 
 **Latency.** The requirement is ≤ 100 ms per frame at 120,000 points. The
-system reaches ~300 ms at 128k points and meets 100 ms at roughly 25k. The
-anti-patterns that made the original 4,247 ms are gone — there is no Python
-loop over points anywhere in the hot path and no repeated full-array scan —
+system reaches 370 ms at 128k points (72 ms at 8k, 135 ms at 32k), so it meets
+the 100 ms budget at roughly 19k points and misses it by 3.7× at the required
+one. The anti-patterns that made the original 4,246 ms are gone — there is no
+Python loop over points anywhere in the hot path and no repeated full-array
+scan —
 and what remains is real vectorised work, dominated by per-point semantics and
 the map insert. The full per-stage breakdown is in `docs/RESULTS.md`; the
 number is reported rather than rounded towards the target.
@@ -171,10 +243,12 @@ against one. The synthetic sensor model is a genuine raycast simulation — real
 occlusion, 1/r³ ground falloff, multi-echo, material reflectance — but it is
 not a substitute for that check.
 
-**Far-field terrain classification is weak.** Drivable-vs-rough IoU falls from
-0.69/0.83 in the near bands to 0.23/0.08 beyond 30 m, where the beam footprint
-mixes road and verge. The range-stratified tables exist precisely so this is
-visible rather than averaged away.
+**Far-field terrain classification is weak.** Beyond 30 m the beam footprint
+mixes road and verge, and both ground classes collapse: `ground_drivable` IoU
+runs 0.69 / 0.83 in the 0–10 m and 10–30 m bands and falls to 0.23 / 0.15 in
+the 30–60 m and 60–100 m ones; `ground_rough` runs 0.68 / 0.82 and falls to
+0.08 / 0.07 (`docs/semantic_eval.csv`). The range-stratified tables exist
+precisely so this is visible rather than averaged away.
 
 ---
 
@@ -196,9 +270,12 @@ adaptive_lidar/
   scripts/    profiling, training, verification, baselines, report
   tests/      248 tests
   models/     the trained weights
-  docs/       RESULTS.md, ARCHITECTURE.md, figures, CSVs
+  docs/       RESULTS.md, ARCHITECTURE.md, screenshots, figures, CSVs
+  visualization/  the dashboard's renderers + the vendored three.js scene
+README.md     this file — start here
 PROGRESS.md   the working log, with pasted verification output
 DECISIONS.md  every judgement call and its reason
+LICENSE       MIT, plus the third-party notice for three.js
 ```
 
 ---
@@ -226,6 +303,24 @@ DECISIONS.md  every judgement call and its reason
 
 ## Requirements
 
-Python 3.11+ with `numpy`, `scipy`, `torch` (CPU wheel), `streamlit`, `pandas`,
-`matplotlib`, `pyyaml`, `pillow`, `pytest`. All free and open source; nothing
-requires a GPU, and nothing requires a network connection at run time.
+Python 3.11–3.13 with `numpy`, `scipy`, `torch` (CPU wheel), `streamlit`,
+`streamlit-image-coordinates`, `pandas`, `matplotlib`, `pyyaml`, `pillow` and
+`pytest`. [`adaptive_lidar/requirements.txt`](adaptive_lidar/requirements.txt)
+is the source of truth and
+[`docs/DEPENDENCIES.md`](adaptive_lidar/docs/DEPENDENCIES.md) explains each
+line, the optional `pypatchworkpp` path and the CUDA packages deliberately
+left out. All free and open source; nothing requires a GPU, and nothing
+requires a network connection at run time. Everything reported here was
+measured on Python 3.13.1, Windows, CPU only.
+
+---
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE). The bundled three.js r128
+(`visualization/scene_frontend/vendor/three.min.js`) is MIT as well, and is
+vendored so the Scene demo renders with nothing fetched at run time.
+
+No dataset is redistributed here: the scenes the demo runs on are generated by
+the raycast sensor model in `data/`, and the SemanticKITTI and RELLIS-3D
+loaders read a tree you supply yourself.

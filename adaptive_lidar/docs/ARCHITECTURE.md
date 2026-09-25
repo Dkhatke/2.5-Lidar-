@@ -266,7 +266,7 @@ adaptive_lidar/
     scene_frontend/        index.html, scene.js, vendored three.js
     scene_demo.py          the Scene demo tab
     drive_tab.py           scene presets + the diagnostics panel
-  scripts/                 profiling, training, the five verifications,
+  scripts/                 profiling, training, the verification scripts,
                            baselines, report generation
   tests/                   248 tests, including the gt-isolation guard
 ```
@@ -275,9 +275,12 @@ adaptive_lidar/
 
 ## The dashboard
 
-Three tabs: **Live demo** (default), **Research & evaluation**, **Debug &
-cell inspector**. The demo is first because the engineering readout answers
-the second question a reviewer has, not the first.
+Four tabs: **Live demo** (default), **Scene demo**, **Research &
+evaluation**, **Debug & cell inspector**. The demo is first because the
+engineering readout answers the second question a reviewer has, not the
+first. The Scene demo is described under *The scene view* below; it shares the
+frame, the playback state and the selection with the Live demo and runs
+nothing of its own.
 
 The Live demo is one `st.fragment`. Everything inside it reads the playback
 cache, so advancing a frame, changing the camera or clicking a cell
