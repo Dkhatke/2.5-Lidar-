@@ -1,7 +1,5 @@
 # Adaptive Variable-Resolution 2.5D LiDAR Mapping
 
-**Smart India Hackathon 2026 · DRDO · Problem Statement 26053 — Adaptive
-Variable Resolution 2.5D LiDAR Mapping for Dynamic Environment Perception**
 
 ![Python 3.11-3.13](https://img.shields.io/badge/python-3.11%E2%80%933.13-blue)
 ![CPU only](https://img.shields.io/badge/hardware-CPU%20only-success)
